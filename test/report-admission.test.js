@@ -13,7 +13,12 @@ const { createReportAdmission } = require('../src/report-admission');
 // A tiny in-memory store with just the surface the service touches. Records
 // every call so a test can assert the ORDER of operations, which is where the
 // "duplicate check LAST, after indexing and notifying" invariant lives.
-function fakeStore({ existingPerson = null, existingReportPhoto = null, ownerOverride = null } = {}) {
+function fakeStore({
+  existingPerson = null,
+  existingReportPhoto = null,
+  ownerOverride = null,
+  suppressedExternalIds = []
+} = {}) {
   const events = [];
   let nextPersonId = 100;
   let nextUpdateId = 500;
@@ -23,6 +28,12 @@ function fakeStore({ existingPerson = null, existingReportPhoto = null, ownerOve
 
   return {
     events,
+    // La constancia de un borrado a solicitud (#191). El servicio la consulta
+    // antes de crear cualquier cosa, así que el doble tiene que responderla.
+    async isExternalIdSuppressed(externalId) {
+      events.push({ op: 'isExternalIdSuppressed', externalId });
+      return suppressedExternalIds.includes(externalId);
+    },
     async findOrCreatePerson(name) {
       events.push({ op: 'findOrCreatePerson', name });
       if (existingPerson) return { person: existingPerson, created: false };
@@ -48,6 +59,12 @@ function fakeStore({ existingPerson = null, existingReportPhoto = null, ownerOve
     async getPerson(id) {
       events.push({ op: 'getPerson', id });
       return peopleById.get(id) || null;
+    },
+    // El doble no modela concurrencia real (no hay nada con quien competir en
+    // estas pruebas): pasa directo, transparente para el orden de `events`
+    // que las pruebas de arriba ya verifican.
+    async withExternalIdLock(externalId, fn) {
+      return fn();
     }
   };
 }
@@ -298,6 +315,64 @@ test('external_id upsert resolves the ACTUAL owner before notify and response', 
   // And "merged into existing" is true: the report joined an old record even
   // though the name lookup inserted a fresh (drifted) row.
   assert.equal(res.mergedIntoExisting, true);
+});
+
+// ---------------------------------------------------------- supresión (#191)
+
+test('una llave suprimida no escribe NADA — ni la persona vuelve a existir', async () => {
+  const store = fakeStore({ suppressedExternalIds: ['ficha-suprimida'] });
+  const t = tracker();
+  const svc = buildService(store, t);
+
+  const res = await svc.admitReport({
+    name: 'Persona Prueba Uno',
+    status: 'missing',
+    source: 'aggregator',
+    externalId: 'ficha-suprimida',
+    photos: [{ bytes: Buffer.from('foto'), contentType: 'image/jpeg' }]
+  });
+
+  assert.equal(res.ok, false);
+  assert.equal(res.suppressed, true);
+  // Lo que de verdad importa: el chequeo va antes de todo lo demás, así que no
+  // se creó la persona ni se indexó una cara. Un rechazo después de
+  // findOrCreatePerson dejaría la ficha viva de todos modos.
+  assert.deepEqual(
+    store.events.map((e) => e.op),
+    ['isExternalIdSuppressed'],
+    'lo único que debía tocarse es la consulta de supresión'
+  );
+  assert.deepEqual(t.calls, [], 'ni foto, ni notificación, ni chequeo de duplicados');
+});
+
+test('la supresión es por llave exacta: otra llave de la misma persona sí entra', async () => {
+  const store = fakeStore({ suppressedExternalIds: ['ficha-suprimida'] });
+  const t = tracker();
+  const svc = buildService(store, t);
+
+  const res = await svc.admitReport({
+    name: 'Persona Prueba Uno',
+    status: 'missing',
+    source: 'aggregator',
+    externalId: 'otra-ficha'
+  });
+  assert.equal(res.ok, true);
+});
+
+test('un reporte sin external_id nunca se bloquea, ni consulta la supresión', async () => {
+  const store = fakeStore({ suppressedExternalIds: ['ficha-suprimida'] });
+  const t = tracker();
+  const svc = buildService(store, t);
+
+  // El formulario web y el bot no mandan llave. Si una familia reporta de
+  // verdad a alguien cuya ficha se borró, tiene que poder: bloquear eso sería
+  // peor que el problema que la supresión arregla.
+  const res = await svc.admitReport({ name: 'Persona Prueba Uno', status: 'missing', source: 'web' });
+  assert.equal(res.ok, true);
+  assert.ok(
+    !store.events.some((e) => e.op === 'isExternalIdSuppressed'),
+    'sin llave no hay nada que consultar'
+  );
 });
 
 test('a brand-new person is not reported as merged', async () => {

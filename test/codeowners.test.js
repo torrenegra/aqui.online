@@ -56,6 +56,25 @@ const PIEZAS_VIGILADAS = [
     define: /function\s+notifySubscribers\s*\(/,
     porque: 'decide a quién se le escribe cuando aparece una novedad de una persona',
   },
+  {
+    nombre: 'resolveFicha',
+    define: /function\s+resolveFicha\s*\(/,
+    porque:
+      'cierra una ficha en SIN CONFIRMAR como A SALVO o FALLECIDO(A): cambia lo que el ' +
+      'listado público dice de alguien y manda el aviso a quien la está buscando',
+  },
+
+  // La superficie de mascotas tiene su propio bloque de contacto, en
+  // src/routes/pets.js, y no reusa matchContactBlock: es otra pantalla y otro
+  // dato. Pero es el MISMO tipo de dato —el teléfono o el correo de una
+  // persona, mostrado a un desconocido— así que lleva el mismo freno. Se
+  // vigila la interpolación, no el copy: si mañana cambia el texto pero el
+  // contacto sigue saliendo a pantalla, esto tiene que seguir matcheando.
+  {
+    nombre: 'el contacto del dueño de una mascota',
+    define: /esc\(pet\.contact\)/,
+    porque: 'pinta en pantalla el teléfono o el correo de quien perdió una mascota, ante cualquiera que suba una foto parecida',
+  },
 
   // --- El consentimiento y la promesa que se le hace a quien sube una foto ---
   {
@@ -67,6 +86,19 @@ const PIEZAS_VIGILADAS = [
     nombre: 'searchOnlyCheckbox',
     define: /const\s+searchOnlyCheckbox\s*=/,
     porque: 'es la casilla con la que una persona consiente (o no) que su reporte se publique',
+  },
+
+  // El equivalente de RESCUE_PRIVACY del lado de mascotas. La diferencia es
+  // dónde vive la promesa: en personas es el texto que se le muestra a quien
+  // sube la foto, y acá es el borrado mismo, que el código dejó a propósito
+  // FUERA del try que puede fallar (src/petmatch.js). Se vigila esa forma
+  // —la condición y la llamada juntas— porque es lo que hace que la promesa
+  // se cumpla aunque comparar falle; vigilar solo el nombre de la función
+  // dejaría pasar que alguien la moviera adentro del try.
+  {
+    nombre: 'el borrado de la foto de «encontré» de una mascota',
+    define: /kind\s*===\s*'query'\)\s*await\s+petStore\.clearPetPhotoContent\s*\(/,
+    porque: 'es el borrado incondicional de la foto de quien encontró una mascota, la promesa de que de esa foto solo queda su embedding',
   },
 
   // --- El filtro de salida ---------------------------------------------------
@@ -103,6 +135,18 @@ const PIEZAS_VIGILADAS = [
     nombre: 'SearchFacesCommand',
     define: /new\s+SearchFacesCommand\s*\(/,
     porque: 'es la comparación que decide si un rescatista tiene enfrente a la persona que alguien busca',
+  },
+
+  // Mascotas no usa Rekognition: usa un servicio de embeddings propio por
+  // HTTP (src/petfaces.js), así que las dos piezas de arriba no la miran y por
+  // eso esta superficie entró sin vigilancia. Que la cara no sea humana no la
+  // saca de la categoría: sigue siendo una foto que sale de este proceso hacia
+  // un tercero. Se vigila el punto exacto donde los bytes se adjuntan a la
+  // petición, que es el análogo de construir el comando de Rekognition.
+  {
+    nombre: 'el envío de la foto de una mascota al servicio de embeddings',
+    define: /form\.append\(\s*['"]image['"]/,
+    porque: 'es donde la foto de una mascota sale de este proceso hacia un servicio externo, con un secreto compartido y sin más portero',
   },
 
   // --- Las puertas -----------------------------------------------------------

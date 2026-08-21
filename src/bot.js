@@ -5,6 +5,7 @@ const { relayEnabled, STATUS_LABEL } = require('./notify');
 const {
   processPhoto,
   resolveRescueAnswer,
+  forgetPersonFaces,
   MAX_QUERY_PHOTOS
 } = require('./facematch');
 const { nullMatcher } = require('./faces');
@@ -63,6 +64,58 @@ function parseMessage(text) {
   // para alguien que está al lado de una persona rescatada. Un texto libre
   // no dispara ninguna acción sobre datos; buscar exige BUSCAR.
   return { intent: 'unrecognized' };
+}
+
+// #156: cuatro ramas de handleInbound devuelven su respuesta sin mirar si
+// venía una foto adjunta, y la foto se pierde en silencio — quien la mandó
+// cree que la enviamos, y no queda ni indexada ni comparada contra nada.
+// Alcance de este fix (opción 1 del issue): decirlo. Procesar la foto en
+// alguna de estas ramas es una decisión de privacidad aparte (no hay
+// consentimiento explícito fuera del formulario web) y queda para otro PR.
+// El texto no puede decir "no venía con un comando reconocido": en las ramas
+// find y unsubscribe SÍ hay un comando válido (BUSCAR, BAJA) — lo que falta
+// es que sea uno de los que procesan fotos. Decir lo contrario manda a
+// reenviar la misma foto con el mismo BUSCAR, que tampoco la va a usar.
+//
+// Y tiene que ofrecer los comandos de reporte, no solo BIEN. El caso más
+// probable que cae en `unrecognized` es alguien escribiendo en lenguaje
+// natural que NO encuentra a un familiar y adjuntando su foto — el ejemplo
+// del propio #156. Ofrecerle únicamente "BIEN <nombre>" lo empuja a
+// registrarla como a salvo: un dato falso, y justo el que hace que nadie la
+// siga buscando.
+//
+// Por eso DESAPARECIDO va en su PROPIA viñeta y no junto a BIEN/HERIDO: los
+// tres son reportes, pero no describen la misma situación. BIEN y HERIDO los
+// manda quien encontró a la persona; DESAPARECIDO, quien no sabe dónde está.
+// Meterlos en una sola línea rotulada "si la encontraste" volvía a decir algo
+// falso — el mismo defecto de la versión anterior, en la otra dirección — y
+// dejaba a quien está buscando sin ninguna línea que lo describa.
+//
+// FALLECIDO queda fuera a propósito, y no por descuido: procesa la foto
+// igual que los otros tres (las cuatro palabras entran por el mismo intent
+// 'report'). Se omite por dos razones que apuntan al mismo lado. La primera
+// es consistencia: HELP tampoco lo lista, así que este aviso sería el único
+// lugar del bot que lo ofrece, y un aviso automático no es donde se estrena
+// un comando que el producto no anuncia. La segunda es el costo del error:
+// este texto sale justamente cuando NO entendimos el mensaje, y de todas las
+// sugerencias posibles esa es la que peor se equivoca si la persona la toma
+// por descarte. Quien tenga que reportar un fallecimiento sigue pudiendo
+// hacerlo — el comando funciona igual que antes de este cambio.
+//
+// "no la guardé" es literal en las cuatro ramas, no una manera de hablar:
+// ninguna llama a `processPhoto` ni a `admitReport`, que son los dos únicos
+// caminos por los que una foto entra a la base o al índice facial. Los bytes
+// que bajó el webhook se quedan en memoria y se van con la petición.
+const PHOTO_NOT_PROCESSED_NOTE = [
+  '📷 Recibí una foto, pero con este mensaje no puedo usarla, así que no la guardé.',
+  'Para que sirva, mándala otra vez con el comando como leyenda:',
+  '• SUSCRIBIR <nombre> — si estás buscando a esa persona',
+  '• BIEN / HERIDO <nombre> — si la encontraste',
+  '• DESAPARECIDO <nombre> — si no sabes dónde está'
+].join('\n');
+
+function withPhotoNote(reply, photo) {
+  return photo ? `${reply}\n\n${PHOTO_NOT_PROCESSED_NOTE}` : reply;
 }
 
 // Acuse fijo para un mensaje que no es un comando (#118). No repite la frase
@@ -161,24 +214,27 @@ async function handleInbound(store, { channel, from, text, photo, matcher = null
   const parsed = parseMessage(text);
 
   if (parsed.intent === 'unrecognized') {
-    return UNRECOGNIZED_REPLY;
+    return withPhotoNote(UNRECOGNIZED_REPLY, photo);
   }
 
   if (parsed.intent === 'help' || (parsed.intent !== 'help' && !parsed.name)) {
-    return HELP;
+    return withPhotoNote(HELP, photo);
   }
 
   if (parsed.intent === 'find') {
     const matches = await store.searchPeople(parsed.name, { limit: 3 });
     if (!matches.length) {
-      return [
-        `No encontré reportes sobre "${parsed.name}".`,
-        `Escribe SUSCRIBIR ${parsed.name} y te avisaré a este número cuando haya noticias.`
-      ].join('\n');
+      return withPhotoNote(
+        [
+          `No encontré reportes sobre "${parsed.name}".`,
+          `Escribe SUSCRIBIR ${parsed.name} y te avisaré a este número cuando haya noticias.`
+        ].join('\n'),
+        photo
+      );
     }
     const lines = await Promise.all(matches.map((m) => personSummary(store, m)));
     lines.push('', 'Para recibir avisos: SUSCRIBIR <nombre>');
-    return lines.join('\n');
+    return withPhotoNote(lines.join('\n'), photo);
   }
 
   if (parsed.intent === 'report') {
@@ -245,21 +301,27 @@ async function handleInbound(store, { channel, from, text, photo, matcher = null
   }
 
   if (parsed.intent === 'unsubscribe') {
+    // El retiro de firmas (#162) es best effort y no cambia esta respuesta —
+    // se construye del `count` que ya devolvió el borrado. Se espera de
+    // todos modos (no fire-and-forget): en un runtime serverless, cualquier
+    // trabajo sin await muere apenas se manda la respuesta al webhook.
     if (normalize(parsed.name) === 'todo' || normalize(parsed.name) === 'all') {
-      const n = await store.unsubscribeAll(channel, from);
-      return n
-        ? `Listo, cancelé tus ${n} suscripciones.`
-        : 'No tenías suscripciones activas.';
+      const { count, faceIds } = await store.unsubscribeAll(channel, from);
+      if (!count) return withPhotoNote('No tenías suscripciones activas.', photo);
+      await forgetPersonFaces(matcher, faceIds, 'BAJA TODO');
+      return withPhotoNote(`Listo, cancelé tus ${count} suscripciones.`, photo);
     }
     const matches = await store.searchPeople(parsed.name, { limit: 1 });
-    if (!matches.length) return `No encontré a "${parsed.name}" entre tus suscripciones.`;
-    const n = await store.unsubscribe(matches[0].id, channel, from);
-    return n
-      ? `Listo, ya no recibirás avisos sobre *${matches[0].full_name}*.`
-      : `No estabas suscrito(a) a ${matches[0].full_name}.`;
+    if (!matches.length) {
+      return withPhotoNote(`No encontré a "${parsed.name}" entre tus suscripciones.`, photo);
+    }
+    const { count, faceIds } = await store.unsubscribe(matches[0].id, channel, from);
+    if (!count) return withPhotoNote(`No estabas suscrito(a) a ${matches[0].full_name}.`, photo);
+    await forgetPersonFaces(matcher, faceIds, `suscripción de persona ${matches[0].id}`);
+    return withPhotoNote(`Listo, ya no recibirás avisos sobre *${matches[0].full_name}*.`, photo);
   }
 
-  return HELP;
+  return withPhotoNote(HELP, photo);
 }
 
 module.exports = { handleInbound, parseMessage, rescueAnswer, HELP };

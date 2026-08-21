@@ -633,7 +633,10 @@ test('a match without family contact offers the aviso form and stores the aviso'
   assert.match(html, /No — yo soy quien la está buscando/);
   assert.match(
     html,
-    /href="\/report\?name=Mariana%20Prueba%20Torres&desde=\d+"/,
+    // `&amp;` y no `&`: la URL entera pasa por esc() antes de entrar al
+    // atributo, que es lo que pide la regla del repo, y esa es la forma
+    // correcta de serializar un `&` dentro de un atributo HTML.
+    /href="\/report\?name=Mariana%20Prueba%20Torres&amp;desde=\d+"/,
     'quien la busca sale de acá al formulario de reporte, con el nombre ya puesto'
   );
 

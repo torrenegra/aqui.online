@@ -140,6 +140,43 @@ async function relayToOperators({ reason, channel, address, subject, text, perso
   return { ...result, relayed: true };
 }
 
+// Neutraliza saltos de línea y demás caracteres de control antes de que un
+// texto escrito por alguien de afuera entre a un log. El resumen de /ideas y
+// /bug es texto libre: sin esto, uno que traiga su propio salto de línea
+// fabrica una línea de log entera, y quien diagnostica termina leyendo un
+// evento que nunca ocurrió.
+function logSafe(value) {
+  return String(value === null || value === undefined ? '' : value).replace(/[\u0000-\u001f\u007f]/g, ' ');
+}
+
+// Manda un correo al buzón de operación con el asunto y el cuerpo que arma
+// quien llama. Comparte la mecánica de `relayToOperators` (leer `avisoEmail()`
+// en vivo, degradar con un log claro si no está configurada, nunca lanzar)
+// pero sin su plantilla fija de "aviso retenido de coincidencia" — para los
+// llamadores que arman su propio texto porque lo que mandan no es ni un aviso
+// de coincidencia ni una actualización de estado: hoy son el aviso de un
+// rescatista (POST /rescate/aviso) y el respaldo de /ideas y /bug cuando
+// GitHub no responde. Antes cada uno reimplementaba el mismo "si hay buzón,
+// mandar; si no, loguear y degradar" con su propia forma.
+async function mailOperators(subject, body) {
+  const to = avisoEmail();
+  if (!to) {
+    // Este log lleva el asunto y NO el cuerpo, al revés que el de
+    // `relayToOperators`. La diferencia es deliberada: allá el texto se vuelca
+    // porque el log es la ÚNICA copia que queda del aviso, y ese comentario lo
+    // dice. Acá esa razón no aplica — el aviso del rescatista ya quedó
+    // guardado con `addUpdate` antes de intentar este correo (por eso su
+    // llamador lo llama "best effort"), así que el cuerpo es recuperable de la
+    // base. Volcarlo aquí regalaría, a cambio de nada, el teléfono de quien
+    // avisa y el lugar donde dice que está la persona: en zona de desastre ese
+    // par es materia de extorsión, no un campo más. El asunto alcanza para
+    // saber qué se perdió e ir a buscarlo.
+    console.error(`[notify:operadores] PERDIDO — AVISO_EMAIL sin configurar. asunto="${logSafe(subject)}"`);
+    return { ok: false, error: 'AVISO_EMAIL no configurada' };
+  }
+  return sendEmail(to, subject, body);
+}
+
 // Returns { ok, status, error } and logs loudly — email silence is a bug we
 // must be able to diagnose from the Vercel logs alone.
 //
@@ -193,7 +230,11 @@ async function sendEmail(to, subject, text, { html } = {}) {
     return { ok: true, status: res.status };
   } catch (e) {
     console.error(`[notify:email] THREW to=${to}`, e);
-    return { ok: false, error: e.message };
+    // `fetch` normalmente rechaza con un Error de verdad, pero no es una
+    // garantía del lenguaje — un `e` sin `.message` (por ejemplo `undefined`)
+    // tumbaría este catch y con él cualquier aviso que dependa de esta
+    // función, justo en el camino que se supone que nunca lanza.
+    return { ok: false, error: e?.message || String(e) };
   }
 }
 
@@ -427,6 +468,8 @@ module.exports = {
   notifyMode,
   relayEnabled,
   relayToOperators,
+  mailOperators,
+  logSafe,
   avisoEmail,
   rescueConfirmTemplate,
   rescueSourceTemplate,

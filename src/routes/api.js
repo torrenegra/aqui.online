@@ -127,6 +127,9 @@ function apiRoutes(store, matcher, petStore, petMatcher) {
   //   POST with the same external_id updates this same update idempotently
   //   instead of creating a duplicate — safe to retry or re-sync from upstream.
   //   source_url is part of that upsert, so a re-push corrects a wrong link.
+  //   Si esa llave está suprimida —la ficha se borró a solicitud de la persona
+  //   (#191)— la respuesta es 409 con `suppressed: true` y no se crea nada.
+  //   Reintentar no la corrige: esa llave no vuelve a entrar.
   router.post(
     '/updates',
     requireKey,
@@ -164,6 +167,19 @@ function apiRoutes(store, matcher, petStore, petMatcher) {
         photos: photo ? [photo] : [],
         checkDuplicates: true
       });
+      // Una llave suprimida no es un cuerpo mal formado: es una decisión ya
+      // tomada sobre esa ficha (#191). Se responde aparte y explícito para que
+      // quien empuja pueda distinguirlas — un 400 se reintenta creyendo que hay
+      // algo que corregir, y este caso no se corrige nunca. Devuelve la llave
+      // que el propio llamador mandó, para que la marque en su registro y deje
+      // de mandarla.
+      if (!result.ok && result.suppressed) {
+        return res.status(409).json({
+          error: result.errors.join(' '),
+          suppressed: true,
+          external_id: externalId
+        });
+      }
       // Unreachable today — the checks above already cover exactly what the
       // service validates — but the service is the single source of truth for
       // its own contract: a caller that stops prevalidating, or a validation
@@ -278,11 +294,18 @@ function apiRoutes(store, matcher, petStore, petMatcher) {
           // Mismo orden que el DELETE del ARCO, y por la misma razón: los ids
           // antes del borrado porque la cascada se los lleva, y las firmas
           // después, cuando ya no hay ficha que dejar huérfana.
+          //
+          // Lo que este borrado NO hace, a propósito, es suprimir la llave
+          // externa (#191): eso es constancia de que alguien ejerció un
+          // derecho, y acá nadie pidió nada — se están limpiando filas que
+          // sembramos nosotros. Suprimirlas bloquearía para siempre una llave
+          // de prueba, que es un efecto que nadie pidió y que no se ve hasta
+          // que la ficha real no puede entrar.
           const faceIds = await store.faceIdsForPerson(p.id);
           const deleted = await store.deletePerson(p.id);
           if (!deleted) continue;
           removed.push({ id: p.id, name: p.full_name });
-          const faces = await forgetPersonFaces(matcher, faceIds, p.id);
+          const faces = await forgetPersonFaces(matcher, faceIds, `persona ${p.id}`);
           firmas.total += faces.total;
           firmas.deleted += faces.deleted;
           firmas.unconfirmed.push(...faces.unconfirmed);
@@ -298,6 +321,11 @@ function apiRoutes(store, matcher, petStore, petMatcher) {
   // Borra las dos copias del rastro: la fila (y en cascada sus reportes,
   // suscripciones y fotos) y las firmas faciales en la colección de
   // Rekognition, que no viven en la base y por tanto la cascada no toca.
+  //
+  // Y deja constancia (#191): la fila se va, pero las llaves externas con las
+  // que esa ficha podría volver a entrar quedan suprimidas. Sin eso el borrado
+  // duraba hasta el siguiente re-envío del agregador, que insertaba la ficha de
+  // nuevo y le reindexaba la cara sin que nada lo registrara.
   router.delete(
     '/people/:id',
     wrap(async (req, res) => {
@@ -312,7 +340,12 @@ function apiRoutes(store, matcher, petStore, petMatcher) {
       // Los ids se leen ANTES del borrado: la cascada se lleva las filas de
       // `photos` y con ellas la única forma de saber qué firmas retirar.
       const faceIds = await store.faceIdsForPerson(req.params.id);
-      const deleted = await store.deletePerson(req.params.id);
+      // `atSubjectRequest` es lo que separa este borrado del de registros de
+      // prueba: este es alguien ejerciendo un derecho, así que borrar ES
+      // suprimir, y las dos escrituras van juntas en la misma transacción del
+      // adaptador — la durabilidad no puede depender de que un handler se
+      // acuerde de un segundo paso.
+      const deleted = await store.deletePerson(req.params.id, { atSubjectRequest: true });
       if (!deleted) return res.status(404).json({ error: 'Persona no encontrada' });
       // Y las firmas DESPUÉS, ya sabiendo que la ficha se fue. Al revés —como
       // abrió este PR— si la base fallaba en el medio quedaban las firmas
@@ -322,14 +355,19 @@ function apiRoutes(store, matcher, petStore, petMatcher) {
       // lo conservan. De las dos huérfanas posibles esa es la peor, porque le
       // cuesta algo a quien está buscando a un familiar. Nunca lanza, así que
       // un Rekognition caído tampoco deshace el borrado ya hecho.
-      const faces = await forgetPersonFaces(matcher, faceIds, deleted.id);
+      const faces = await forgetPersonFaces(matcher, faceIds, `persona ${deleted.id}`);
       res.json({
         ok: true,
         deleted: { id: deleted.id, full_name: deleted.full_name },
         // Lo que quedó por retirar. Reintentar el DELETE ya no sirve —la
         // persona no existe y sus ids se fueron con ella—, así que esta
         // respuesta y el log son el único rastro para limpiarlo a mano.
-        faces
+        faces,
+        // Cuántas llaves quedaron suprimidas. Va el CONTEO y no las llaves:
+        // quien atiende la solicitud necesita saber que la constancia se
+        // escribió, y la llave la elige quien empuja —puede traer un nombre
+        // adentro— así que no tiene por qué terminar en un log de respuesta.
+        suppressed_external_ids: deleted.suppressed_external_ids
       });
     })
   );
@@ -578,6 +616,130 @@ function apiRoutes(store, matcher, petStore, petMatcher) {
       );
       info.veredicto = emailVerdict(info);
       res.json({ email: info });
+    })
+  );
+
+  // ---------------------------------------------- contactos hechos FUERA de la app
+  //
+  // POST /api/contact-log registra que una persona del equipo contactó, desde
+  // su propio buzón o su propio teléfono, a quien reportó a alguien. La app no
+  // tiene forma de enterarse sola: el envío no pasó por ninguno de sus
+  // caminos. Sin esto, la ficha de esa persona y el panel dicen "nadie la ha
+  // contactado", que es falso.
+  //
+  // Tres garantías estructurales, no convenciones:
+  //
+  // 1. `source` se fuerza a 'operador' acá adentro. Un llamador externo NO
+  //    puede escribir en la serie de la app ni aunque lo pida: no hay campo
+  //    que lo permita. Por eso la gráfica "Envíos por canal" no se puede
+  //    contaminar desde afuera.
+  // 2. Nada de lo que entra identifica un destinatario. Ni dirección, ni
+  //    número, ni nombre, ni cuerpo del mensaje: persona + canal + fecha +
+  //    resultado, y una referencia opaca. Un campo de más en el body se
+  //    ignora; no hay dónde guardarlo.
+  // 3. `ref` DEBE ser un digesto SHA-256 en hexadecimal, y la ruta lo valida.
+  //    No es formalismo: el `wamid` que devuelve la API de WhatsApp lleva el
+  //    teléfono del destinatario codificado en base64 adentro, así que
+  //    aceptarlo crudo metería el número de una familia en esta base. Que la
+  //    validación viva en el código y no en un párrafo de documentación es lo
+  //    que hace imposible el accidente.
+  //
+  // A diferencia de la bitácora interna (src/logbook.js, que se traga sus
+  // propios errores para no retrasar jamás un envío real), acá un fallo SÍ se
+  // le reporta al llamador: no hay ningún flujo de emergencia esperando, y un
+  // registro que falla en silencio deja al panel afirmando lo contrario de lo
+  // que pasó.
+  const EXTERNAL_REF_RE = /^[a-f0-9]{64}$/;
+  const EXTERNAL_CHANNELS = ['email', 'whatsapp'];
+  // 'rechazado' no existe para un contacto externo: significa "la app decidió
+  // por su cuenta no intentar nada", y una persona que escribe desde su buzón
+  // no tiene ese estado. O se mandó, o falló.
+  const EXTERNAL_RESULTS = ['enviado', 'fallido'];
+  // El primer commit del repo. Nada de lo que esta ruta registra puede haber
+  // pasado antes de que la app existiera.
+  const INICIO_DEL_REGISTRO = Date.parse('2026-08-10T00:00:00Z');
+
+  router.post(
+    '/contact-log',
+    requireKey,
+    wrap(async (req, res) => {
+      const body = req.body || {};
+      const person = await store.getPerson(body.person_id);
+      if (!person) return res.status(404).json({ error: 'Persona no encontrada' });
+      if (!EXTERNAL_CHANNELS.includes(body.channel)) {
+        return res.status(400).json({ error: `channel debe ser uno de: ${EXTERNAL_CHANNELS.join(', ')}` });
+      }
+      if (!EXTERNAL_RESULTS.includes(body.result)) {
+        return res.status(400).json({ error: `result debe ser uno de: ${EXTERNAL_RESULTS.join(', ')}` });
+      }
+      const ref = String(body.ref || '').trim().toLowerCase();
+      if (!EXTERNAL_REF_RE.test(ref)) {
+        return res.status(400).json({
+          error:
+            'ref debe ser un digesto SHA-256 en hexadecimal (64 caracteres). El identificador crudo del proveedor no puede viajar: un wamid de WhatsApp lleva el teléfono del destinatario codificado adentro. Hashéalo en tu máquina y manda solo el digesto.'
+        });
+      }
+      const occurredAt = new Date(body.occurred_at);
+      if (!body.occurred_at || Number.isNaN(occurredAt.getTime())) {
+        return res.status(400).json({ error: 'Falta occurred_at (fecha ISO 8601 del contacto)' });
+      }
+      // Un contacto en el futuro es un error de zona horaria del registrador,
+      // y entra corriendo hacia adelante la serie de días del panel. Cinco
+      // minutos de tolerancia por el desfase de reloj entre máquinas.
+      if (occurredAt.getTime() > Date.now() + 5 * 60 * 1000) {
+        return res.status(400).json({ error: 'occurred_at está en el futuro' });
+      }
+      // Y la cota simétrica: un contacto anterior al día en que el proyecto
+      // existe no es un hecho, es el mismo error de zona horaria (o una línea
+      // mal formada) corriendo la serie hacia el otro lado. Importa porque
+      // contactLogEarliest({ source: 'operador' }) fecha el "medido desde" de
+      // la sección externa: un 1970 ahí pinta como instrumentados cincuenta
+      // años en los que nadie contactó a nadie.
+      if (occurredAt.getTime() < INICIO_DEL_REGISTRO) {
+        return res.status(400).json({ error: 'occurred_at es anterior al inicio del proyecto' });
+      }
+
+      const { inserted } = await store.insertContactLog({
+        personId: person.id,
+        updateId: null,
+        channel: body.channel,
+        result: body.result,
+        source: 'operador',
+        externalRef: ref,
+        // Mismo formato ISO sin milisegundos que usa el resto del esquema en
+        // SQLite (`date(created_at, '-5 hours')` lo parsea); en Postgres la
+        // columna es TIMESTAMPTZ y el string se castea igual.
+        createdAt: occurredAt.toISOString().replace(/\.\d{3}Z$/, 'Z')
+      });
+
+      res.status(inserted ? 201 : 200).json({
+        ok: true,
+        // false = esta referencia ya estaba registrada. No es un error: el
+        // reintento del registrador es exactamente el caso que external_ref
+        // existe para absorber.
+        created: inserted,
+        person_id: person.id
+      });
+    })
+  );
+
+  // DELETE /api/contact-log/:ref — deshace UN registro externo.
+  //
+  // Existe porque registrar "a esta persona se le avisó el 12 de agosto" es
+  // una AFIRMACIÓN sobre un hecho pasado, y una afirmación que no se puede
+  // retirar no debería poder hacerse. El filtro `source = 'operador'` vive en
+  // el adapter: este camino no puede borrar un envío que la app sí hizo, ni
+  // por error ni a propósito.
+  router.delete(
+    '/contact-log/:ref',
+    requireKey,
+    wrap(async (req, res) => {
+      const ref = String(req.params.ref || '').trim().toLowerCase();
+      if (!EXTERNAL_REF_RE.test(ref)) {
+        return res.status(400).json({ error: 'ref debe ser un digesto SHA-256 en hexadecimal (64 caracteres)' });
+      }
+      const deleted = await store.deleteContactLogByRef(ref);
+      res.json({ ok: true, deleted });
     })
   );
 

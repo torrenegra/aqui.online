@@ -1,5 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert');
+const fs = require('node:fs');
+const path = require('node:path');
 const sharp = require('sharp');
 const { createSqliteAdapter } = require('../src/store/sqlite');
 const { createPetStore } = require('../src/pets');
@@ -475,5 +477,82 @@ test('backfillUnindexedPetPhotos borra los bytes de una foto "encontré" aunque 
     stored.content.length,
     0,
     'los bytes de una foto "encontré" deben borrarse aunque el backfill no haya logrado generar un embedding'
+  );
+});
+
+// El borrado de la foto de «encontré» vive FUERA del try — y eso se verifica
+// por ALCANCE, no por cercanía de texto.
+//
+// Por qué hace falta esta prueba y no basta la de codeowners.test.js: allá el
+// patrón `kind === 'query') await petStore.clearPetPhotoContent(` solo
+// establece que las dos cosas están pegadas en el texto. Si alguien mueve esa
+// línea DENTRO del try y conserva la forma, aquel patrón sigue coincidiendo —
+// y la promesa se rompe en silencio: un error transitorio de base dejaría los
+// bytes de la foto guardados para siempre.
+//
+// Acá se mide lo que de verdad importa: que la llamada ocurra después de que
+// cierra el bloque que puede fallar.
+test('el borrado de una foto «query» corre aunque guardar el embedding o comparar fallen', () => {
+  const fuente = fs.readFileSync(path.join(__dirname, '..', 'src', 'petmatch.js'), 'utf8');
+
+  function finDelBloque(desde) {
+    let profundidad = 0;
+    for (let i = desde; i < fuente.length; i++) {
+      if (fuente[i] === '{') profundidad++;
+      else if (fuente[i] === '}') {
+        profundidad--;
+        if (profundidad === 0) return i;
+      }
+    }
+    return -1;
+  }
+
+  // Todo se mide DENTRO del cuerpo de processPetPhoto. Sin acotar, un borrado
+  // de otra función (backfillUnindexedPetPhotos hace uno parecido) alcanzaría
+  // para que la prueba pase mientras esta función se queda con los bytes.
+  const firma = fuente.indexOf('async function processPetPhoto(');
+  assert.ok(firma !== -1, 'no encontré processPetPhoto — ¿se renombró?');
+  // El `{` del CUERPO, no el del destructuring de los parámetros: la firma es
+  // `processPetPhoto(petStore, petMatcher, { petId, kind, ... }) {`, así que el
+  // primer `{` después del nombre abre la lista de parámetros y delimitaría un
+  // trozo de dos líneas en vez de la función.
+  const inicioCuerpo = fuente.indexOf(') {', firma) + 2;
+  const finCuerpo = finDelBloque(inicioCuerpo);
+  assert.ok(finCuerpo !== -1, 'no pude delimitar el cuerpo de processPetPhoto');
+  const cuerpo = fuente.slice(inicioCuerpo, finCuerpo);
+
+  // `await matchPetPhoto(` y no `matchPetPhoto(` a secas: lo segundo cae en la
+  // DEFINICIÓN de esa otra función, que está antes y fuera de cualquier try.
+  const dentroDelTry = cuerpo.indexOf('await matchPetPhoto(');
+  assert.ok(dentroDelTry !== -1, 'no encontré la llamada a matchPetPhoto dentro de processPetPhoto');
+  const inicioTry = cuerpo.lastIndexOf('try {', dentroDelTry);
+  assert.ok(inicioTry !== -1, 'matchPetPhoto ya no está dentro de un try — revisa si la promesa sigue en pie');
+
+  function finDelBloqueEn(texto, desde) {
+    let profundidad = 0;
+    for (let i = desde; i < texto.length; i++) {
+      if (texto[i] === '{') profundidad++;
+      else if (texto[i] === '}') {
+        profundidad--;
+        if (profundidad === 0) return i;
+      }
+    }
+    return -1;
+  }
+  const finTry = finDelBloqueEn(cuerpo, cuerpo.indexOf('{', inicioTry));
+  const inicioCatch = cuerpo.indexOf('{', cuerpo.indexOf('catch', finTry));
+  const finCatch = finDelBloqueEn(cuerpo, inicioCatch);
+  assert.ok(finCatch !== -1, 'no pude encontrar el cierre del catch');
+
+  // Y se exige el borrado DE SU PROPIA FOTO: `photo.id`, no cualquier borrado.
+  const borrado = /if\s*\(\s*kind\s*===\s*'query'\s*\)\s*await\s+petStore\.clearPetPhotoContent\s*\(\s*photo\.id\s*\)/g;
+  const posiciones = [...cuerpo.matchAll(borrado)].map((m) => m.index);
+  assert.ok(posiciones.length > 0, "no encontré `clearPetPhotoContent(photo.id)` guardado por `kind === 'query'`");
+  assert.ok(
+    posiciones.some((p) => p > finCatch),
+    'el borrado de la foto «query» quedó DENTRO del bloque que puede fallar.\n\n' +
+      'Si guardar el embedding o comparar lanza, el borrado no corre y los bytes de la foto de\n' +
+      'quien encontró la mascota se quedan en la base — justo lo que la promesa dice que no pasa.\n' +
+      'Tiene que ir después de que cierra el catch, incondicional.'
   );
 });

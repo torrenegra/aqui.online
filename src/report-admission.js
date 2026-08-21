@@ -5,6 +5,10 @@
 // sequence of business rules has to run every time:
 //
 //   1. Validate and normalize the input.
+//   1b. Refuse a report whose external_id was suppressed by a deletion request
+//      (#191) — before anything is written, so nothing gets re-created. Steps
+//      1b through 4 run under a per-external_id lock shared with `deletePerson`
+//      (#192) — see the comment at the top of that block for why.
 //   2. Find or create the person by name.
 //   3. Add (or, with external_id, upsert) the update.
 //   4. Resolve the ACTUAL owner of the update. external_id can land the row on
@@ -124,49 +128,106 @@ function createReportAdmission({
     const cleanSourceUrl = normalizeSourceUrl(sourceUrl);
     const usablePhotos = (photos || []).filter((p) => p && p.bytes && p.bytes.length);
 
-    // ---- 2. Find or create the person ----------------------------------
-    const { person, created } = await store.findOrCreatePerson(cleanName);
+    // ---- 1b–4. ¿Está suprimida? Si no, buscar/crear y escribir el update --
+    // Todo este tramo corre bajo el MISMO lock por external_id que sostiene
+    // `deletePerson` mientras suprime esa llave (#192, `withExternalIdLock` en
+    // los dos adaptadores). Sin el lock, el chequeo de abajo podía dar "no
+    // suprimida" y quedar en el aire — por un `await` cualquiera de los que ya
+    // había entre el chequeo y la escritura— mientras un DELETE concurrente
+    // suprimía esa misma llave y se llevaba la fila; cuando este código
+    // seguía, escribía igual y la ficha revivía sin log ni error (hallazgo de
+    // coderabbitai en el PR). Adentro del lock solo va lo que decide SI la
+    // ficha se recrea o no; la indexación de fotos y las notificaciones
+    // (pasos 5-7, más abajo) siguen afuera a propósito: son best-effort y no
+    // tienen por qué sostener un lock mientras esperan a Rekognition o a
+    // SendGrid.
+    //
+    // Sin external_id no hay llave que proteger, así que no hay lock que
+    // pedir: un reporte sin external_id no compite con nada (#191).
+    const admit = async () => {
+      // ---- 1b. ¿La llave de este reporte está suprimida? -------------------
+      // Alguien pidió el borrado de su ficha (DELETE /api/people/:id) y eso
+      // dejó constancia de la llave con la que había entrado. Sin este chequeo
+      // el borrado no es durable: la fila ya no existe, así que el
+      // ON CONFLICT (external_id) del upsert no aplica y un re-envío de la
+      // misma ficha inserta de nuevo — persona nueva, foto nueva y la cara
+      // reindexada, sin log ni error.
+      //
+      // El issue lo pedía en POST /api/updates; vive acá porque acá es donde
+      // la frase "protege contra cualquier ruta de ingreso" es verdad. Este
+      // servicio es la secuencia compartida de las tres puertas (web, API,
+      // WhatsApp) y de la que se agregue mañana; en el handler del API solo
+      // protegería a ese handler.
+      //
+      // El alcance es la MISMA llave externa, y el límite es deliberado: un
+      // reporte sin external_id no se bloquea nunca. Si una familia reporta a
+      // esa persona de verdad más adelante —por el formulario, que no manda
+      // llave— tiene que poder. Lo que se suprime es la re-entrada automática
+      // de una ficha, no el derecho de nadie a reportar. Hoy solo el API
+      // acepta external_id, así que las otras dos puertas no pueden llegar
+      // hasta acá.
+      //
+      // Va ANTES de findOrCreatePerson a propósito: más adelante ya habría una
+      // persona creada, que es justo lo que hay que evitar.
+      if (externalId && (await store.isExternalIdSuppressed(externalId))) {
+        return {
+          ok: false,
+          suppressed: true,
+          errors: ['Esta ficha se borró a solicitud de la persona y no se vuelve a crear.']
+        };
+      }
 
-    // Read the record's existing report photo BEFORE this report's own photos
-    // are stored — afterwards there is no way to tell which face was already
-    // there and which one just arrived. That pre-existing face is the whole
-    // point of the "possible duplicate" comparison the web page draws, which
-    // is the only caller that asks for it.
-    const priorPhoto =
-      includePriorPhoto && !created
-        ? (await store.reportPhotoByPerson([person.id])).get(person.id) || null
-        : null;
+      // ---- 2. Find or create the person ----------------------------------
+      const { person, created } = await store.findOrCreatePerson(cleanName);
 
-    // ---- 3. Add / upsert the update ------------------------------------
-    const update = await store.addUpdate(person.id, {
-      status,
-      message,
-      location,
-      lat,
-      lng,
-      source: cleanSource,
-      sourceUrl: cleanSourceUrl,
-      reporter,
-      contact,
-      externalId
-    });
+      // Read the record's existing report photo BEFORE this report's own
+      // photos are stored — afterwards there is no way to tell which face was
+      // already there and which one just arrived. That pre-existing face is
+      // the whole point of the "possible duplicate" comparison the web page
+      // draws, which is the only caller that asks for it.
+      const priorPhoto =
+        includePriorPhoto && !created
+          ? (await store.reportPhotoByPerson([person.id])).get(person.id) || null
+          : null;
 
-    // ---- 4. Resolve the ACTUAL owner -----------------------------------
-    // With external_id the upsert may have landed on a different person than
-    // the one just looked up (the aggregator's name for this external_id
-    // drifted). Resolve who actually owns the timeline row before notifying,
-    // so alerts never reach the wrong subscribers and the response never
-    // reports the wrong person. This is a system invariant, not an API detail.
-    const owner =
-      update.person_id === person.id
-        ? person
-        : (await store.getPerson(update.person_id)) || person;
+      // ---- 3. Add / upsert the update ------------------------------------
+      const update = await store.addUpdate(person.id, {
+        status,
+        message,
+        location,
+        lat,
+        lng,
+        source: cleanSource,
+        sourceUrl: cleanSourceUrl,
+        reporter,
+        contact,
+        externalId
+      });
 
-    // "This report was appended to a record that already existed." Read from
-    // where the update ACTUALLY landed, not from the name lookup: with
-    // external_id the upsert can keep its original person while
-    // findOrCreatePerson inserted a fresh row for the drifted name.
-    const mergedIntoExisting = !created || String(owner.id) !== String(person.id);
+      // ---- 4. Resolve the ACTUAL owner -----------------------------------
+      // With external_id the upsert may have landed on a different person
+      // than the one just looked up (the aggregator's name for this
+      // external_id drifted). Resolve who actually owns the timeline row
+      // before notifying, so alerts never reach the wrong subscribers and the
+      // response never reports the wrong person. This is a system invariant,
+      // not an API detail.
+      const owner =
+        update.person_id === person.id
+          ? person
+          : (await store.getPerson(update.person_id)) || person;
+
+      // "This report was appended to a record that already existed." Read
+      // from where the update ACTUALLY landed, not from the name lookup: with
+      // external_id the upsert can keep its original person while
+      // findOrCreatePerson inserted a fresh row for the drifted name.
+      const mergedIntoExisting = !created || String(owner.id) !== String(person.id);
+
+      return { ok: true, person, created, priorPhoto, update, owner, mergedIntoExisting };
+    };
+
+    const admitted = externalId ? await store.withExternalIdLock(externalId, admit) : await admit();
+    if (!admitted.ok) return admitted;
+    const { created, priorPhoto, update, owner, mergedIntoExisting } = admitted;
 
     // ---- 5. Index the report photos ------------------------------------
     // processPhoto never throws for a matcher/Rekognition failure — it stores

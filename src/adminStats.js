@@ -323,8 +323,40 @@ function buildStatsPageHtml({ generatedAt, counts, activity, matcherStatus, extr
     ${detailsBlock('Ver la tabla exacta, día por día', dailyTable(daily))}
   </div>`;
 
+  // Los contactos que el equipo hizo POR FUERA de la app viven en su propia
+  // sección, con su propio título y SIN gráfica — deliberadamente. Meterlos en
+  // la gráfica de arriba, aunque fuera como una barra más, rompería lo único
+  // que esa gráfica sirve para responder: si el relevo está reteniendo y si la
+  // app entregó. Quien mañana investigue por qué hay 88 retenidos no puede
+  // encontrarse al lado un "correo: 24" que la app nunca mandó.
+  const outreachPivot = pivotContact(activity.outreach);
+  const outreachTotals = sumContact(outreachPivot);
+  // Misma supresión de celdas pequeñas (#132) que el resto del panel: estas
+  // cifras describen a personas concretas igual que las de arriba, y un total
+  // exacto al lado de un "<5" permite deducir la celda oculta por resta.
+  const outreachSummary = suppressBreakdown(
+    [
+      { key: 'enviado', value: pivotSum(outreachPivot, 'enviado') },
+      { key: 'fallido', value: pivotSum(outreachPivot, 'fallido') }
+    ],
+    outreachTotals.total
+  );
+  const outreachByKey = Object.fromEntries(outreachSummary.cells.map((c) => [c.key, c]));
+  const outreachSection = `<div class="stats-section">
+    ${section('Contactos que hizo el equipo por fuera de la app')}
+    <p class="stats-note">Correos y mensajes que una persona del equipo mandó desde su propio buzón o su propio teléfono, y que registró después por <code>POST /api/contact-log</code> con la fecha real del contacto. <strong>No entran en la gráfica de arriba ni en ninguna de las series de la app</strong>: aquélla mide lo que hizo el software, ésta mide lo que hizo una persona. Un cero acá significa "no se ha registrado ninguno", no "no se contactó a nadie" — la app no puede enterarse sola de un correo que salió de otro buzón.</p>
+    ${table(
+      ['Canal', 'Entregados', 'Fallidos'],
+      ['email', 'whatsapp'].map((ch) => {
+        const c = contactCells(outreachPivot[ch]);
+        return [CHANNEL_LABEL[ch], c.enviado.display, c.fallido.display];
+      })
+    )}
+    <p class="stats-note">Total registrado: ${outreachSummary.total.display} (${outreachByKey.enviado.display} entregados). El detalle por persona —a quién se avisó y cuándo— se ve en la ficha de cada persona, y solo con sesión de administración.</p>
+  </div>`;
+
   const channelSection = `<div class="stats-section">
-    ${section('Envíos por canal (acumulado)')}
+    ${section('Envíos por canal (acumulado) — solo lo que mandó la app')}
     <div class="stats-chart-card">${contactByChannelChart(contactPivot, CHANNEL_LABEL)}</div>
     ${bitacoraDetails}
   </div>`;
@@ -673,6 +705,7 @@ function buildStatsPageHtml({ generatedAt, counts, activity, matcherStatus, extr
     ${rescuedPeopleSection}
     ${dailySection}
     ${channelSection}
+    ${outreachSection}
     ${similaritySection}
     ${matchKnowledgeSection}
     ${matchOutcomeSection}

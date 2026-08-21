@@ -1,5 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert');
+const sharp = require('sharp');
 const { createSqliteAdapter } = require('../src/store/sqlite');
 const { createStore } = require('../src/people');
 const { handleInbound, parseMessage } = require('../src/bot');
@@ -199,4 +200,132 @@ test('help for unknown/empty messages', async () => {
   const store = await freshStore();
   const r = await handleInbound(store, { channel: 'whatsapp', from: '99', text: 'ayuda' });
   assert.match(r, /Comandos/);
+});
+
+// #156: cuatro ramas devolvían su respuesta sin mirar `photo`, y la foto se
+// perdía en silencio — sin avisarlo y sin que ninguna función del matcher se
+// llamara. Cada prueba de acá abajo afirma la causa (el matcher no se toca)
+// y no solo el texto: un mensaje que dijera "recibí tu foto" sin agregar el
+// aviso de #156 habría pasado una prueba que solo mirara el texto.
+function matcherEspia() {
+  const llamadas = { indexFace: false, detectFace: false, searchByImage: false };
+  return {
+    espia: llamadas,
+    matcher: {
+      enabled: true,
+      async indexFace() {
+        llamadas.indexFace = true;
+        return { faceId: 'cara-de-prueba', geometry: null };
+      },
+      async detectFace() {
+        llamadas.detectFace = true;
+        return null;
+      },
+      async searchByImage() {
+        llamadas.searchByImage = true;
+        return [];
+      }
+    }
+  };
+}
+
+const FOTO_DE_PRUEBA = { bytes: Buffer.from('jpeg-de-prueba'), contentType: 'image/jpeg' };
+
+test('una foto en un mensaje no reconocido no se indexa y se avisa (#156)', async () => {
+  const store = await freshStore();
+  const { matcher, espia } = matcherEspia();
+  const r = await handleInbound(store, {
+    channel: 'whatsapp',
+    from: '573001112200',
+    text: 'no sé qué comando usar pero le mando la foto igual',
+    photo: FOTO_DE_PRUEBA,
+    matcher
+  });
+  assert.deepEqual(espia, { indexFace: false, detectFace: false, searchByImage: false });
+  assert.match(r, /Recibí una foto, pero con este mensaje no puedo usarla, así que no la guardé/);
+  // El aviso tiene que ofrecerle a esta persona los dos caminos que sirven
+  // para lo que está haciendo: buscar (SUSCRIBIR) o reportar una
+  // desaparición. Proponerle solo BIEN la empujaba a registrar como a salvo
+  // a alguien a quien no encuentra, que es el dato que hace que nadie la
+  // siga buscando.
+  assert.match(r, /• SUSCRIBIR <nombre> — si estás buscando a esa persona/);
+  assert.match(r, /• DESAPARECIDO <nombre> — si no sabes dónde está/);
+  // Y DESAPARECIDO va en su propia viñeta: agruparlo con BIEN/HERIDO bajo
+  // "si la encontraste" describe la situación contraria a la que reporta.
+  assert.match(r, /• BIEN \/ HERIDO <nombre> — si la encontraste/);
+  assert.doesNotMatch(r, /DESAPARECIDO <nombre> — si la encontraste/);
+});
+
+test('una foto con AYUDA (o mensaje vacío) no se indexa y se avisa (#156)', async () => {
+  const store = await freshStore();
+  const { matcher, espia } = matcherEspia();
+  const r = await handleInbound(store, {
+    channel: 'whatsapp',
+    from: '573001112201',
+    text: 'ayuda',
+    photo: FOTO_DE_PRUEBA,
+    matcher
+  });
+  assert.deepEqual(espia, { indexFace: false, detectFace: false, searchByImage: false });
+  assert.match(r, /Comandos/);
+  assert.match(r, /Recibí una foto, pero con este mensaje no puedo usarla, así que no la guardé/);
+});
+
+test('una foto con BUSCAR sin resultados no se indexa y se avisa (#156)', async () => {
+  const store = await freshStore();
+  const { matcher, espia } = matcherEspia();
+  const r = await handleInbound(store, {
+    channel: 'whatsapp',
+    from: '573001112202',
+    text: 'BUSCAR Nadie Con Este Nombre',
+    photo: FOTO_DE_PRUEBA,
+    matcher
+  });
+  assert.deepEqual(espia, { indexFace: false, detectFace: false, searchByImage: false });
+  assert.match(r, /No encontré reportes/);
+  assert.match(r, /Recibí una foto, pero con este mensaje no puedo usarla, así que no la guardé/);
+});
+
+test('una foto con BAJA no se indexa y se avisa (#156)', async () => {
+  const store = await freshStore();
+  const phone = '573001112203';
+  await handleInbound(store, { channel: 'whatsapp', from: phone, text: 'SUSCRIBIR Carla Prueba Tres' });
+
+  const { matcher, espia } = matcherEspia();
+  const r = await handleInbound(store, {
+    channel: 'whatsapp',
+    from: phone,
+    text: 'BAJA Carla Prueba Tres',
+    photo: FOTO_DE_PRUEBA,
+    matcher
+  });
+  assert.deepEqual(espia, { indexFace: false, detectFace: false, searchByImage: false });
+  assert.match(r, /ya no recibirás avisos/);
+  assert.match(r, /Recibí una foto, pero con este mensaje no puedo usarla, así que no la guardé/);
+});
+
+// Control: report y subscribe SÍ procesan la foto (ya lo hacían antes de
+// #156) y por lo tanto no deben llevar el aviso de "no la usé". Necesita una
+// imagen de verdad (no el buffer de relleno de arriba): con leyenda de
+// comando el flujo SÍ intenta decodificarla para la miniatura antes de
+// indexar, y un buffer ilegible se guarda sin indexar por una razón aparte —
+// eso rompería esta prueba sin decir nada sobre #156.
+async function fotoValida() {
+  return sharp({ create: { width: 200, height: 250, channels: 3, background: { r: 80, g: 60, b: 100 } } })
+    .jpeg()
+    .toBuffer();
+}
+
+test('una foto con BIEN sí se indexa y no lleva el aviso de #156', async () => {
+  const store = await freshStore();
+  const { matcher, espia } = matcherEspia();
+  const r = await handleInbound(store, {
+    channel: 'whatsapp',
+    from: '573001112204',
+    text: 'BIEN Dario Prueba Cuatro: está bien',
+    photo: { bytes: await fotoValida(), contentType: 'image/jpeg' },
+    matcher
+  });
+  assert.equal(espia.indexFace, true, 'un reporte con foto sí debe indexar la cara');
+  assert.doesNotMatch(r, /Recibí una foto, pero con este mensaje no puedo usarla, así que no la guardé/);
 });

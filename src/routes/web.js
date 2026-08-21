@@ -2,11 +2,12 @@ const crypto = require('crypto');
 const express = require('express');
 const env = require('../env');
 const { upload } = require('../upload');
-const { sendVerificationEmail, sendEmail, avisoEmail, relayEnabled } = require('../notify');
+const { sendVerificationEmail, mailOperators, logSafe, relayEnabled } = require('../notify');
 const {
   identifyRescuedPerson,
   notifyRescuerOfMatches,
   backfillPhotoDerivatives,
+  forgetPersonFaces,
   MAX_QUERY_PHOTOS
 } = require('../facematch');
 const { esc, layout, updateCard, timeTag, facePlate, LOCATION_SCRIPT } = require('../html');
@@ -14,7 +15,9 @@ const { isReadyToShow } = require('../report-photo');
 const gh = require('../github');
 const { logContact, resultFromSend } = require('../logbook');
 const { RESCUE_ANCHOR_PREFIX } = require('../people');
+const { readSession } = require('../adminAuth');
 const { createReportAdmission } = require('../report-admission');
+const { RESCUE_PRIVACY, searchOnlyCheckbox, matchContactBlock } = require('../rescue-contact');
 
 // Express 4 doesn't catch async errors on its own.
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
@@ -113,23 +116,8 @@ function composeContact({ phone, email, contact }) {
 // prometer tiempos que no controlamos.
 const REVIEWED_NOTE = 'Cada aviso lo revisa antes una persona del equipo, así que puede tomar un momento.';
 
-const RESCUE_PRIVACY = `<p class="privacy">🔒 <strong>La foto no se guarda.</strong> Se compara al instante contra las fotos de las personas reportadas como desaparecidas y se borra de inmediato: no queda almacenada en ningún servidor. Solo conservamos su <em>firma facial</em> (un código que no permite reconstruir la imagen) para poder avisarte si alguien empieza a buscar a esta persona.</p>`;
-
-// Opción de consulta efímera. Va APAGADA y el costo se lee ANTES de marcarla,
-// porque lo que quita no es un detalle: sin firma facial indexada, esta
-// consulta no puede recibir después el aviso de que alguien reportó a esa
-// persona — que es lo más útil que hace la app para quien la está buscando.
-// Escribirlo suave sería venderle privacidad a alguien que en realidad está
-// renunciando al aviso sin darse cuenta.
-// Función y no constante: el reintento tiene que poder devolverla MARCADA, y
-// parchar una plantilla de texto con un `replace` deja de funcionar en silencio
-// el día que alguien reordene los atributos. Acá lo que está en juego es el
-// consentimiento de alguien sobre su propia firma facial.
-const searchOnlyCheckbox = (checked = false) => `<label class="share-check">
-    <input type="checkbox" name="solo_busqueda" value="1"${checked ? ' checked' : ''}>
-    Solo consultar ahora: no guarden nada de esta foto
-  </label>
-  <p class="subtle share-note"><strong>Ojo con lo que esto implica:</strong> no guardamos la firma facial, así que <strong>no vamos a poder avisarte si alguien reporta a esta persona más adelante</strong>. Esta consulta sirve solo para lo que veas ahora en pantalla, y el correo y el WhatsApp de arriba quedan sin efecto. Si la dejas sin marcar, la firma queda guardada y podemos avisarte.</p>`;
+// RESCUE_PRIVACY, searchOnlyCheckbox: movidos a ../rescue-contact.js el
+// 19-ago-2026 (ver .github/CODEOWNERS, bloque "La app pública").
 
 // One small line under the listing heading. Kept honest — the data flows from
 // Encontrados.co's own reports and from Colombia Te Busca, the public photo
@@ -184,69 +172,8 @@ const REPORT_EXIT_BLOCK = `<div class="notice">
 // de su pregunta, y solo en las pantallas donde de verdad hay un punto muerto.
 const RESCUE_FOOTER = `<p><a class="big-btn report" href="/rescate">🔍 Consultar otra persona</a></p>`;
 
-// What the rescuer can DO with a match depends on what the report carries.
-// Reports typed into the app bring the family's contact; the fichas imported
-// from public registries bring none — and a match that ends in "sin datos de
-// contacto" is a dead end exactly when it matters most. In that case the app
-// flips the ask: the rescuer leaves a number and where the person can be
-// found, and the operators relay the aviso back to the source registry (for
-// Colombia Te Busca, filling their information form on the rescuer's behalf).
-function matchContactBlock(m) {
-  // El `contact` de un aviso NO es el contacto de quien la busca: es el
-  // teléfono de un tercero que pasó por acá antes, pegado al sitio donde dijo
-  // que estaba la persona. Los dos datos caen en el mismo campo que usa el
-  // reporte de una familia y hasta acá se pintaban igual, así que el siguiente
-  // desconocido que coincidiera con esa cara los veía en pantalla — después de
-  // que a quien los dejó le prometimos que su teléfono no se mostraba (#120).
-  //
-  // El filtro va acá, al PINTAR, y no sobre el dato guardado: así cubre
-  // también los avisos que ya estaban escritos, sin tocar la base y sin perder
-  // el aviso, que es el insumo con el que un operador hace el relevo.
-  //
-  // `contactUpdate` lo resuelve identifyRescuedPerson (src/facematch.js) y NO
-  // es lo mismo que `m.update`: este último es el más reciente —que puede ser
-  // justamente un aviso—, y aquel es el más reciente cuyo contacto es de quien
-  // la busca. Mirar solo el último dejaba sin mostrar el teléfono que la
-  // familia sí había dejado en un reporte anterior.
-  const fromAviso = m.update && m.update.source === 'rescate';
-  if (m.contactUpdate && m.contactUpdate.contact) {
-    return `<p>📞 <strong>Contacta a quien la busca:</strong> ${esc(m.contactUpdate.contact)}</p>`;
-  }
-  // La bifurcación de acá arriba existe porque medimos quién estaba llenando
-  // este formulario: de 23 avisos recibidos, uno solo tenía forma de rescate.
-  // Los demás los mandó gente que está BUSCANDO a esa persona y llegó hasta
-  // acá porque el botón que vio decía «¿la tienes contigo?» — y terminaba
-  // escribiendo la dirección de la casa de su familiar en un campo que le
-  // pedía dónde encontrarla. Preguntar de frente es más barato que adivinar
-  // después, y le abre a esa persona la puerta que en realidad venía a buscar.
-  //
-  // El nombre va DENTRO de la pregunta a propósito: «esa persona» es
-  // justamente lo que se venía leyendo al revés.
-  const name = esc(m.person.full_name);
-  return `<div class="aviso">
-  <p><strong>La están buscando, pero el reporte no trae un teléfono al que llamar.</strong>${
-    fromAviso ? ' Otra persona ya nos avisó por esta misma ficha y el equipo está haciéndole llegar el aviso a quien la busca.' : ''
-  }</p>
-  <p class="aviso-pregunta">¿Tienes a ${name} contigo en este momento?</p>
-  <details class="aviso-si">
-    <summary class="big-btn report">✅ Sí, está aquí conmigo</summary>
-    <div class="aviso-si-cuerpo">
-      <p>Déjanos tu número y dónde está ${name} ahora: nosotros le hacemos llegar el aviso a quien la busca.</p>
-      <form class="stack compact" method="post" action="/rescate/aviso">
-        <input type="hidden" name="person_id" value="${m.person.id}">
-        <label class="field-label"><span>Tu teléfono (WhatsApp si tienes) *</span>
-          <input name="phone" required maxlength="60" placeholder="Ej. 300 123 4567" autocomplete="tel" inputmode="tel"></label>
-        <label class="field-label"><span>¿En qué lugar está ${name} en este momento? *</span>
-          <input name="location" required maxlength="160" placeholder="Ej. Hospital San Jorge, Pereira — urgencias"></label>
-        <p class="subtle">El sitio donde está <strong>${name}</strong>, no dónde estás tú. Ejemplo: «Hospital San Jorge, Pereira — urgencias» o «Albergue del coliseo, Quibdó».</p>
-        <button class="big-btn report" type="submit">Avisar a quien la busca</button>
-      </form>
-    </div>
-  </details>
-  <a class="big-btn secondary" href="/report?name=${encodeURIComponent(m.person.full_name)}&desde=${m.person.id}">🙋 No — yo soy quien la está buscando</a>
-  <p class="subtle">Si la estás buscando, agrega tu teléfono al reporte: así el rescatista que la encuentre te llama directo, sin que nadie más tenga que intermediar.</p>
-</div>`;
-}
+// matchContactBlock: movido a ../rescue-contact.js el 19-ago-2026 (ver
+// .github/CODEOWNERS, bloque "La app pública").
 
 // The possible-duplicate finding travels from POST /report to the person page
 // in a short-lived cookie rather than in the URL, and this is the whole reason
@@ -369,6 +296,54 @@ ${sameNameCard}
 ${otherCards}`;
 }
 const REPORT_PRIVACY = `<p class="privacy">📢 Las fotos del reporte <strong>se publican</strong> en la lista de personas desaparecidas, con los puntos de reconocimiento facial marcados sobre el rostro. Es lo que permite que un rescatista reconozca a la persona que tiene al lado. Sube solo fotos que quieras hacer públicas.</p>`;
+
+// ------------------------------------------- "¿ya se avisó a quien reportó?"
+//
+// El bloque que responde, en la ficha, la pregunta que hoy no tiene respuesta
+// en ninguna pantalla: si alguien ya le escribió a la persona que reportó a
+// esta otra, y cuándo. Lee `contact_log` a través de familyContactLogByPerson,
+// que ya deja 'relevo' afuera en el SQL — un relevo fue al buzón del equipo,
+// no a una familia, y mostrarlo acá diría lo contrario de lo que pasó.
+//
+// QUIÉN LO VE: solo quien tiene sesión de administración. La ficha sigue
+// siendo pública y para un visitante anónimo no cambia ni un byte. La versión
+// pública de este mismo bloque es una decisión aparte, declarada en el PR:
+// cambia lo que lee una familia (categoría "lo que ve o hace un usuario") y
+// abre una superficie nueva de ingeniería social — un estafador que lee "te
+// escribimos el 12" en una página indexada tiene el detalle corroborante que
+// vuelve creíble una llamada. Eso lo decide una persona, en su propio issue.
+//
+// Ni el bloque ni sus datos dicen a QUIÉN se contactó: la dirección y el
+// número nunca estuvieron en esta tabla y no aparecen acá.
+const CONTACT_CHANNEL_LABEL = { email: 'Correo', whatsapp: 'WhatsApp' };
+const CONTACT_SOURCE_LABEL = {
+  app: 'lo mandó la app',
+  operador: 'lo mandó el equipo, por fuera de la app'
+};
+
+function contactHistoryBlock(rows) {
+  if (!rows || !rows.length) {
+    return `<div class="notice"><p>📣 <strong>Todavía no se ha avisado a quien reportó a esta persona.</strong> No hay ningún contacto registrado — ni de la app, ni del equipo.</p>
+<p class="subtle">Los relevos al buzón del equipo no cuentan acá: un relevo es un aviso retenido, no un aviso entregado.</p></div>`;
+  }
+  const items = rows
+    .map((r) => {
+      const canal = CONTACT_CHANNEL_LABEL[r.channel] || r.channel;
+      const quien = CONTACT_SOURCE_LABEL[r.source] || r.source;
+      const verbo = r.result === 'enviado' ? 'Se avisó por' : 'Falló el aviso por';
+      return `<li>${esc(verbo)} <strong>${esc(canal)}</strong> — ${timeTag(r.created_at)} <span class="subtle">(${esc(quien)})</span></li>`;
+    })
+    .join('');
+  const entregados = rows.filter((r) => r.result === 'enviado').length;
+  const titulo = entregados
+    ? '📣 <strong>Ya se avisó a quien reportó a esta persona.</strong>'
+    : '📣 <strong>Se intentó avisar a quien reportó a esta persona, y no se pudo entregar.</strong>';
+  return `<div class="notice">
+  <p>${titulo}</p>
+  <ul>${items}</ul>
+  <p class="subtle">Solo lo ve el equipo: esta ficha, para cualquier otro visitante, no muestra este bloque.</p>
+</div>`;
+}
 
 // Photos stored before thumbnails existed catch up on their own, so nobody has
 // to run a maintenance command for the listing to start showing faces.
@@ -959,33 +934,21 @@ ${RESCUE_FOOTER}`
       // Best effort: the aviso already lives in the timeline; this mail is the
       // operators' real-time signal to go relay it to the source registry. An
       // email failure must never lose the aviso.
-      const operators = avisoEmail();
-      let relayResult;
-      if (operators) {
-        try {
-          relayResult = await sendEmail(
-            operators,
-            `Aviso de rescatista — ${person.full_name}`,
-            [
-              'Un rescatista informa dónde puede ser localizada una persona reportada como desaparecida.',
-              `Persona: ${person.full_name} (${env.BASE_URL}/person/${person.id})`,
-              `Teléfono del rescatista: ${phone}`,
-              // La etiqueta de esta línea la leen herramientas que procesan
-              // este buzón. Es un nombre de campo, no copy: cambiarlo rompe su
-              // parseo en silencio. La pregunta que se le hace al rescatista sí
-              // se reformuló, arriba en el formulario.
-              `Dónde puede ser localizada: ${location}`,
-              '',
-              'Siguiente paso: verificar y hacer llegar el aviso a la fuente del reporte (Colombia Te Busca: llenar su formulario de información en nombre del rescatista).'
-            ].join('\n')
-          );
-        } catch (e) {
-          console.error('[rescate:aviso] email failed:', e.message);
-          relayResult = { ok: false, error: e.message };
-        }
-      } else {
-        relayResult = { ok: false, error: 'AVISO_EMAIL no configurada' };
-      }
+      const relayResult = await mailOperators(
+        `Aviso de rescatista — ${person.full_name}`,
+        [
+          'Un rescatista informa dónde puede ser localizada una persona reportada como desaparecida.',
+          `Persona: ${person.full_name} (${env.BASE_URL}/person/${person.id})`,
+          `Teléfono del rescatista: ${phone}`,
+          // La etiqueta de esta línea la leen herramientas que procesan
+          // este buzón. Es un nombre de campo, no copy: cambiarlo rompe su
+          // parseo en silencio. La pregunta que se le hace al rescatista sí
+          // se reformuló, arriba en el formulario.
+          `Dónde puede ser localizada: ${location}`,
+          '',
+          'Siguiente paso: verificar y hacer llegar el aviso a la fuente del reporte (Colombia Te Busca: llenar su formulario de información en nombre del rescatista).'
+        ].join('\n')
+      );
       // Bitácora (#116): esto es un aviso OPERATIVO al equipo — pide que un
       // operador verifique y reenvíe a la fuente — no un aviso a una persona.
       // Mismo canal 'relevo' que ya usa el relevo de coincidencias pendientes
@@ -1172,6 +1135,18 @@ ${LOCATION_SCRIPT}`,
       }
       const updates = await store.getUpdates(person.id);
       const photo = (await store.reportPhotoByPerson([person.id])).get(person.id);
+      // Bitácora de avisos a quien reportó — solo con sesión de
+      // administración. La consulta ni siquiera se hace para un visitante
+      // anónimo: una ficha pública no debe pagar una consulta más por un
+      // bloque que no va a renderizar.
+      const isTeam = !!readSession(req);
+      const contactHistory = isTeam ? contactHistoryBlock(await store.familyContactLogByPerson(person.id)) : '';
+      // La respuesta deja de ser la misma para todo el mundo en cuanto este
+      // bloque aparece. Sin esto, un intermediario que cachee la página por
+      // URL podría servirle a un visitante anónimo la copia que se armó para
+      // el equipo. Hoy nada cachea esta ruta; el encabezado es lo que hace
+      // que siga siendo cierto si mañana algo lo hace.
+      if (isTeam) res.set('Cache-Control', 'private, no-store');
       // Only worth a banner when the newest report ISN'T the located one —
       // otherwise it just repeats the card right below it.
       const lastLocated = updates.find((u) => u.location);
@@ -1237,6 +1212,7 @@ ${
     : ''
 }
 ${duplicates}
+${contactHistory}
 <div class="person-body">
   <h1>${esc(person.full_name)}</h1>
   <div class="person-updates">
@@ -1307,12 +1283,16 @@ ${updates.length ? updates.map((u) => updateCard(u)).join('') : '<p class="subtl
   router.all(
     '/unsubscribe',
     wrap(async (req, res) => {
+      // La suscripción ya se lleva sus face_id (la cascada de subscription_id
+      // se llevaría la fila de `photos` con ellos — #162); retirarlos de
+      // Rekognition después es best effort y nunca bloquea la confirmación.
       const sub = await store.unsubscribeByToken(req.query.token);
       if (!sub) {
         return res
           .status(404)
           .send(layout('Enlace inválido', '<p class="error">Este enlace ya no es válido: el aviso no existe.</p>'));
       }
+      await forgetPersonFaces(matcher, sub.faceIds, `suscripción ${sub.id}`);
       res.send(
         layout(
           'Aviso cancelado',
@@ -1419,26 +1399,19 @@ ${feedbackForm(kind, values)}
         // to the operators so it can be filed by hand — from the sender's side
         // the outcome is the same, which is the point.
         if (!issue.ok) {
-          const to = avisoEmail();
-          if (to) {
-            try {
-              await sendEmail(
-                to,
-                `[${k.noun}] ${summary}`,
-                [
-                  `No se pudo crear el issue en GitHub (${issue.error || 'motivo desconocido'}). Queda aquí para abrirlo a mano.`,
-                  '',
-                  `Tipo: ${k.noun}`,
-                  `Resumen: ${summary}`,
-                  '',
-                  details || '(sin detalles)'
-                ].join('\n')
-              );
-            } catch (e) {
-              console.error(`[${kind}] email de respaldo falló:`, e.message);
-            }
-          } else {
-            console.error(`[${kind}] PERDIDO — sin GITHUB_TOKEN y sin AVISO_EMAIL: "${summary}"`);
+          const result = await mailOperators(
+            `[${k.noun}] ${summary}`,
+            [
+              `No se pudo crear el issue en GitHub (${issue.error || 'motivo desconocido'}). Queda aquí para abrirlo a mano.`,
+              '',
+              `Tipo: ${k.noun}`,
+              `Resumen: ${summary}`,
+              '',
+              details || '(sin detalles)'
+            ].join('\n')
+          );
+          if (!result.ok) {
+            console.error(`[${kind}] PERDIDO — sin GitHub y sin este respaldo por correo (${result.error}): "${logSafe(summary)}"`);
           }
         }
 

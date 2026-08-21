@@ -41,11 +41,52 @@
 //     por eso no aparece en `checks.listForRef`. Quien llame tiene que
 //     mezclar las dos fuentes — si solo mira check runs, este gate aborta en
 //     todos los PRs y el aprobador queda muerto sin que nadie entienda por
-//     qué. Y su verde significa **«la revisión corrió»**, no «la revisión
-//     salió limpia»: CodeRabbit reporta `success` incluso cuando dejó
-//     hallazgos, así que exigirlo garantiza que el revisor miró, nunca que
-//     estuvo de acuerdo.
+//     qué. Y su `conclusion` sola NO alcanza como señal: CodeRabbit reporta
+//     `success` tanto cuando revisó y no encontró nada como cuando NO revisó
+//     — cupo agotado, PR en draft, y lo que aparezca después (issue #199, dos
+//     causas medidas en dos días, por mecanismos distintos). Por eso, para
+//     este check puntual, el gate exige además que la `description` lo
+//     afirme — ver `CODERABBIT_REVIEWED_RE` más abajo.
 const REQUIRED_CHECKS = ['npm test', 'CodeRabbit'];
+
+// El nombre normalizado bajo el que llega el commit status de CodeRabbit
+// (ver `statusesComoChecks` en `cris-approve.yml`). Aparte para no repetir el
+// literal en el chequeo de abajo.
+const CODERABBIT_CHECK = 'CodeRabbit';
+
+// Lista BLANCA, y falla cerrado ante cualquier texto que no reconoce.
+//
+// Por qué blanca y no negra, que era la alternativa barata: enumerar causas
+// de fallo es una carrera que se pierde. Ya van dos, medidas en dos PRs
+// reales el mismo día (19-ago-2026) y por mecanismos distintos —cupo
+// agotado (`Review rate limited`) y PR en draft (`Review skipped: draft
+// pull request`)— y nadie sabe cuántas más hay. Una lista negra deja pasar
+// la próxima en silencio, que es exactamente el defecto que este código
+// existe para cerrar. La afirmación que hace falta es POSITIVA: *esta
+// revisión ocurrió sobre este diff*, no "no coincide con ninguna de las
+// causas de fallo que ya conocemos".
+//
+// El costo se acepta a sabiendas, no por descuido: en esa medición solo se
+// vieron 4 descripciones distintas en 2 PRs. Un éxito legítimo cuyo texto no
+// empiece con "Review completed" —un PR solo de documentación, una variante
+// de copy futura del proveedor— quedaría atascado esperando a una persona.
+// Se prefirió eso —una cola más larga, un fallo VISIBLE— sobre la
+// alternativa —un merge sobre una revisión que nunca ocurrió, un fallo
+// INVISIBLE—. Si el falso positivo aparece en la práctica, esta expresión se
+// afina con datos reales; no se adivina hoy.
+const CODERABBIT_REVIEWED_RE = /^Review completed/i;
+
+// Y quién tiene permitido FIRMAR ese status. Sin esto, la lista blanca de la
+// descripción no protege nada: un commit status no es un check run — lo puede
+// crear CUALQUIER cuenta con permiso de escritura al repo, con el `context` y
+// la `description` que quiera. O sea que sin validar el emisor, cualquiera con
+// push podría escribir un status «CodeRabbit / Review completed» y comprarse la
+// firma del agente.
+//
+// Se compara contra el login del creador, en minúscula. GitHub reporta las
+// Apps con el sufijo `[bot]`, y se aceptan las dos formas porque cuál llega
+// depende de si el status lo creó la App o su cuenta asociada.
+const CODERABBIT_EMISORES = new Set(['coderabbitai', 'coderabbitai[bot]']);
 
 // La segunda etiqueta, y la razón de que este aprobador no sea un clon del de
 // otro repo.
@@ -297,6 +338,39 @@ function decide(input) {
         reason: `el check \`${name}\` no está verde (estado: ${ultimaConcluida.conclusion}).`,
       };
     }
+
+    // El verde de CodeRabbit no basta por sí solo — ver la nota sobre
+    // `CODERABBIT_REVIEWED_RE` arriba. Se exige la afirmación positiva sobre
+    // la MISMA entrada que ya se tomó como definitiva (`ultimaConcluida`),
+    // nunca sobre otra: mezclar entradas distintas dentro del mismo chequeo
+    // reabriría el hueco que esto cierra.
+    if (name === CODERABBIT_CHECK) {
+      // El emisor va PRIMERO. La descripción es texto libre que escribe quien
+      // crea el status, así que preguntarle a un desconocido si revisó no vale
+      // más que su palabra; lo que hay que establecer antes es que el que
+      // habla sea quien decimos.
+      const emisor = String(ultimaConcluida.creator || '').toLowerCase();
+      if (!CODERABBIT_EMISORES.has(emisor)) {
+        return {
+          decision: 'abort',
+          reason:
+            `el check \`${name}\` está verde, pero lo firmó ${emisor ? `\`${emisor}\`` : 'una cuenta que no puedo identificar'}, ` +
+            `que no es CodeRabbit. Un commit status lo puede crear cualquier cuenta con permiso de escritura, ` +
+            `así que un verde de un emisor que no reconozco no es una revisión: espera a una persona.`,
+        };
+      }
+      const descripcion = typeof ultimaConcluida.description === 'string' ? ultimaConcluida.description : '';
+      if (!CODERABBIT_REVIEWED_RE.test(descripcion)) {
+        return {
+          decision: 'abort',
+          reason:
+            `el check \`${name}\` está verde (\`success\`), pero su descripción no afirma que la ` +
+            `revisión ocurrió sobre este diff — encontré: ${descripcion ? `"${descripcion}"` : '(sin descripción)'}. ` +
+            `Solo cuento como revisión real una descripción que empiece con "Review completed"; cualquier ` +
+            `otro texto, conocido o no, espera a una persona (issue #199).`,
+        };
+      }
+    }
   }
 
   // ── Quién posee qué ──
@@ -501,3 +575,6 @@ module.exports = { decide, liveApprovers, parseCodeowners, ownersOf, compile };
 module.exports.REQUIRED_CHECKS = REQUIRED_CHECKS;
 module.exports.NO_USER_EFFECT_LABEL = NO_USER_EFFECT_LABEL;
 module.exports.AUTHORIZING_LABEL = AUTHORIZING_LABEL;
+module.exports.CODERABBIT_CHECK = CODERABBIT_CHECK;
+module.exports.CODERABBIT_REVIEWED_RE = CODERABBIT_REVIEWED_RE;
+module.exports.CODERABBIT_EMISORES = CODERABBIT_EMISORES;

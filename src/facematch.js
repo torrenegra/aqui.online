@@ -923,13 +923,17 @@ async function computeMatchStats(store, matcher) {
 //
 // Recibe los ids en vez de ir a buscarlos: para cuando esto corre, la cascada
 // ya se llevó las filas de `photos`, así que hay que leerlos ANTES del borrado
-// y pasarlos acá (ver la ruta DELETE en src/routes/api.js).
+// y pasarlos acá (ver la ruta DELETE en src/routes/api.js, y el mismo patrón
+// para bajas de suscripción en src/routes/web.js y src/bot.js — #162).
 //
 // Best effort a propósito: la política de privacidad promete el borrado, así
 // que un Rekognition caído NO puede bloquearlo. Lo que no se pudo confirmar se
 // devuelve y se loguea, porque los ids ya no están en ninguna parte de donde
 // volver a leerlos.
-async function forgetPersonFaces(matcher, faceIds, personId) {
+//
+// `label` es solo para ese log: quien llama identifica lo que se borró
+// ("persona 91", "suscripción 44") sin que acá haya que saber de qué se trata.
+async function forgetPersonFaces(matcher, faceIds, label) {
   const faceMatching = await matcherReady(matcher);
 
   const ids = (faceIds || []).filter(Boolean);
@@ -952,7 +956,7 @@ async function forgetPersonFaces(matcher, faceIds, personId) {
     // El único rastro duradero: la respuesta HTTP se la lleva quien llamó, y
     // los ids ya no están en la base para reintentarlo desde ahí.
     console.error(
-      `[facematch:olvido] persona ${personId}: ${unconfirmed.length} firma(s) sin retirar de la colección —`,
+      `[facematch:olvido] ${label}: ${unconfirmed.length} firma(s) sin retirar de la colección —`,
       unconfirmed.join(', ')
     );
   }

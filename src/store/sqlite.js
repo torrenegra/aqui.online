@@ -1,6 +1,7 @@
 // SQLite adapter — local development and tests. Zero setup, single file.
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const Database = require('better-sqlite3');
 
 // #78: the public-registry sweep (source='aggregator') used to push a person
@@ -16,6 +17,17 @@ const Database = require('better-sqlite3');
 // written: whatever real status came before resurfaces, and a person with no
 // other update simply has none — neither missing nor reunited.
 const AGGREGATOR_SAFE_EXCLUSION = `WHERE NOT (u.source = 'aggregator' AND u.status = 'safe')`;
+
+// La llave que se guarda en suppressed_external_ids nunca es el valor crudo
+// (#192, revisión de cris-pappcorn, punto 2 — mismo comentario que en
+// src/store/postgres.js): la llave la elige quien empuja, y hay integradores
+// que usan el nombre completo de la persona como external_id cuando la
+// fuente no trae otro identificador. Guardar el hash mantiene la misma
+// garantía de bloqueo por igualdad exacta sin dejar un dato personal en la
+// única tabla del esquema que a propósito no se borra nunca.
+function hashExternalId(externalId) {
+  return crypto.createHash('sha256').update(String(externalId), 'utf8').digest('hex');
+}
 
 async function createSqliteAdapter(dbPath) {
   if (dbPath !== ':memory:') {
@@ -98,16 +110,36 @@ async function createSqliteAdapter(dbPath) {
     CREATE INDEX IF NOT EXISTS idx_match_log_person ON match_log(person_id);
     CREATE INDEX IF NOT EXISTS idx_match_log_created ON match_log(created_at);
 
+    -- La columna "source" dice QUIÉN ejecutó el contacto, no por qué medio
+    -- (eso es "channel"); "external_ref" es la llave de idempotencia del
+    -- registrador externo, siempre un DIGESTO, nunca el id crudo del proveedor. El
+    -- porqué completo de las dos columnas está en postgres.js — acá va el
+    -- mismo esquema para que los dos motores no se separen.
     CREATE TABLE IF NOT EXISTS contact_log (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
       update_id INTEGER REFERENCES updates(id) ON DELETE CASCADE,
       channel TEXT NOT NULL CHECK (channel IN ('email','whatsapp','relevo')),
       result TEXT NOT NULL CHECK (result IN ('enviado','fallido','rechazado')),
+      source TEXT NOT NULL DEFAULT 'app' CHECK (source IN ('app','operador')),
+      external_ref TEXT,
       created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
     );
     CREATE INDEX IF NOT EXISTS idx_contact_log_person ON contact_log(person_id);
     CREATE INDEX IF NOT EXISTS idx_contact_log_created ON contact_log(created_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_contact_log_external_ref
+      ON contact_log(external_ref) WHERE external_ref IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_contact_log_source ON contact_log(source, created_at);
+
+    -- Constancia de un borrado pedido por la persona misma (#191). Mismas
+    -- reglas que en Postgres, y ahí está el comentario largo con el por qué:
+    -- es la única tabla que a propósito NO cuelga de people(id) —tiene que
+    -- sobrevivir a la fila—, guarda solo la llave y la fecha, y su alcance es
+    -- la misma llave externa y nada más.
+    CREATE TABLE IF NOT EXISTS suppressed_external_ids (
+      external_id TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+    );
 
     CREATE TABLE IF NOT EXISTS pets (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -163,6 +195,31 @@ async function createSqliteAdapter(dbPath) {
     );
     CREATE INDEX IF NOT EXISTS idx_merge_log_person ON merge_log(person_id);
     CREATE INDEX IF NOT EXISTS idx_merge_log_created ON merge_log(created_at);
+
+    -- ===== COLA DE REVISIÓN DE ESTADO (#190) — inicio =====================
+    -- La constancia de la salida humana de una ficha en unknown: quién
+    -- decidió, cuándo y con qué evidencia. Mismas reglas que en Postgres, y
+    -- ahí está el comentario largo con el por qué —incluido por qué NO se
+    -- creó un estado público nuevo, por qué el marcador de "probable" es
+    -- PRIVADO y vive acá, y por qué el enlace de la noticia sigue viviendo en
+    -- updates.source_url—. created_at va como TEXTO ISO en los dos
+    -- motores, con el mismo formato: un TIMESTAMPTZ volvería como Date en
+    -- Postgres y como string acá.
+    CREATE TABLE IF NOT EXISTS status_review (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+      probable_status TEXT NOT NULL CHECK (probable_status IN ('safe','deceased')),
+      evidence_note TEXT NOT NULL,
+      author TEXT NOT NULL,
+      resolved INTEGER NOT NULL DEFAULT 0,
+      update_id INTEGER REFERENCES updates(id) ON DELETE SET NULL,
+      recipients INTEGER,
+      notify_mode TEXT CHECK (notify_mode IN ('direct','relay')),
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_status_review_person ON status_review(person_id);
+    CREATE INDEX IF NOT EXISTS idx_status_review_created ON status_review(created_at);
+    -- ===== COLA DE REVISIÓN DE ESTADO (#190) — fin ========================
   `);
 
   // Older dev databases: add the GPS columns if missing.
@@ -216,10 +273,91 @@ async function createSqliteAdapter(dbPath) {
   db.exec(
     'CREATE UNIQUE INDEX IF NOT EXISTS idx_updates_external_id ON updates(external_id) WHERE external_id IS NOT NULL'
   );
+  // Bases de desarrollo anteriores a que contact_log distinguiera QUIÉN
+  // contactó. Las filas que ya existen son todas de la app y ese es el
+  // DEFAULT, así que la columna no afirma nada nuevo sobre nadie. Igual que
+  // con `source` de updates: SQLite no puede agregar el CHECK por ALTER, así
+  // que una base local vieja acepta cualquier texto en la columna hasta que
+  // se recree — la validación real vive en la ruta, que es por donde entra
+  // todo lo externo.
+  for (const col of ['source TEXT NOT NULL DEFAULT \'app\'', 'external_ref TEXT']) {
+    try {
+      db.exec(`ALTER TABLE contact_log ADD COLUMN ${col}`);
+    } catch { /* already exists */ }
+  }
+  db.exec(
+    'CREATE UNIQUE INDEX IF NOT EXISTS idx_contact_log_external_ref ON contact_log(external_ref) WHERE external_ref IS NOT NULL'
+  );
+  db.exec('CREATE INDEX IF NOT EXISTS idx_contact_log_source ON contact_log(source, created_at)');
+
+  // El WHERE compartido por los tres agregados de contact_log — mismo
+  // contrato que `contactLogWhere` en postgres.js (ver ahí el porqué de que
+  // el default sea 'app' y no "todo").
+  function contactLogWhere({ since, source } = {}) {
+    const conds = [];
+    const params = [];
+    if (since) {
+      conds.push('created_at >= ?');
+      params.push(since);
+    }
+    if (source) {
+      conds.push('source = ?');
+      params.push(source);
+    }
+    return { clause: conds.length ? `WHERE ${conds.join(' AND ')}` : '', params };
+  }
 
   const getPersonStmt = db.prepare('SELECT * FROM people WHERE id = ?');
 
+  // Serializa, por external_id, el chequeo-y-escritura de una admisión
+  // (src/report-admission.js) contra la ventana en la que `deletePerson`
+  // suprime esa misma llave (#192, condición de carrera señalada por
+  // coderabbitai). Un mutex en memoria alcanza acá porque este adaptador vive
+  // en UN solo proceso — SQLite es dev/tests, nunca varias instancias sobre el
+  // mismo archivo (a diferencia de Postgres en Vercel, que necesita un lock a
+  // nivel de base) — así que la garantía es la misma; solo la implementación
+  // no tiene por qué serlo. `externalIdLocks` guarda, por llave, la cola de lo
+  // que ya está encolado; se borra la entrada cuando nadie quedó esperando
+  // detrás, para no crecer para siempre en una instancia que vive días.
+  const externalIdLocks = new Map();
+  function lockExternalId(externalId, fn) {
+    const previous = externalIdLocks.get(externalId) || Promise.resolve();
+    const result = previous.then(fn, fn);
+    const marker = result.catch(() => {});
+    externalIdLocks.set(externalId, marker);
+    marker.finally(() => {
+      if (externalIdLocks.get(externalId) === marker) externalIdLocks.delete(externalId);
+    });
+    return result;
+  }
+  // Pide los locks de una lista de llaves, de una en una, y solo entonces
+  // corre `fn` — así dos borrados con llaves en común nunca se traban entre sí
+  // por pedirlas en órdenes distintos (acá siempre van ordenadas primero).
+  function lockExternalIds(keys, fn) {
+    if (!keys.length) return fn();
+    const [key, ...rest] = keys;
+    return lockExternalId(key, () => lockExternalIds(rest, fn));
+  }
+
+  // Las firmas faciales atadas a una o más suscripciones. Hay que leerlas
+  // ANTES de borrar la suscripción: `photos.subscription_id` también cascada
+  // (ver el esquema arriba), y con la suscripción se va la única fila que
+  // decía qué firma retirar de Rekognition — el mismo problema que
+  // `faceIdsForPerson` ya resuelve para el borrado de persona (#162).
+  function faceIdsForSubscriptionIds(subscriptionIds) {
+    if (!subscriptionIds.length) return [];
+    const marks = subscriptionIds.map(() => '?').join(',');
+    return db
+      .prepare(`SELECT face_id FROM photos WHERE subscription_id IN (${marks}) AND face_id IS NOT NULL`)
+      .all(...subscriptionIds)
+      .map((r) => r.face_id);
+  }
+
+
   return {
+    async withExternalIdLock(externalId, fn) {
+      return lockExternalId(externalId, fn);
+    },
     async insertPerson(fullName, normalized, phonetic) {
       const info = db
         .prepare('INSERT INTO people (full_name, normalized_name, phonetic_name) VALUES (?, ?, ?)')
@@ -383,21 +521,38 @@ async function createSqliteAdapter(dbPath) {
       db.prepare('UPDATE subscriptions SET verified = 1 WHERE id = ?').run(sub.id);
       return { ...sub, verified: 1 };
     },
+    // Igual que deletePerson en src/routes/api.js: los face_id se leen ANTES
+    // de borrar la fila, porque la cascada de subscription_id se la lleva
+    // junto con la única forma de saber qué firma retirar (#162).
     async deleteSubscriptionByToken(token) {
       const sub = db.prepare('SELECT * FROM subscriptions WHERE verify_token = ?').get(token);
       if (!sub) return null;
+      const faceIds = faceIdsForSubscriptionIds([sub.id]);
       db.prepare('DELETE FROM subscriptions WHERE id = ?').run(sub.id);
-      return sub;
+      return { ...sub, faceIds };
     },
     async deleteSubscription(personId, channel, address) {
-      return db
-        .prepare('DELETE FROM subscriptions WHERE person_id = ? AND channel = ? AND address = ?')
-        .run(personId, channel, address).changes;
+      const sub = db
+        .prepare('SELECT id FROM subscriptions WHERE person_id = ? AND channel = ? AND address = ?')
+        .get(personId, channel, address);
+      if (!sub) return { count: 0, faceIds: [] };
+      const faceIds = faceIdsForSubscriptionIds([sub.id]);
+      const info = db.prepare('DELETE FROM subscriptions WHERE id = ?').run(sub.id);
+      return { count: info.changes, faceIds };
     },
     async deleteSubscriptionsForAddress(channel, address) {
-      return db
-        .prepare('DELETE FROM subscriptions WHERE channel = ? AND address = ?')
-        .run(channel, address).changes;
+      const subs = db
+        .prepare('SELECT id FROM subscriptions WHERE channel = ? AND address = ?')
+        .all(channel, address);
+      if (!subs.length) return { count: 0, faceIds: [] };
+      const ids = subs.map((s) => s.id);
+      const faceIds = faceIdsForSubscriptionIds(ids);
+      // Por id, no por (channel, address): ver el comentario equivalente en
+      // postgres.js — una suscripción creada entre el SELECT y este DELETE no
+      // debe quedar alcanzada por él (#162).
+      const marks = ids.map(() => '?').join(',');
+      const info = db.prepare(`DELETE FROM subscriptions WHERE id IN (${marks})`).run(...ids);
+      return { count: info.changes, faceIds };
     },
     async subscriptionsForPerson(personId) {
       return db.prepare('SELECT * FROM subscriptions WHERE person_id = ?').all(personId);
@@ -521,11 +676,61 @@ async function createSqliteAdapter(dbPath) {
         .all(personId)
         .map((r) => r.face_id);
     },
-    async deletePerson(id) {
-      const person = getPersonStmt.get(id);
-      if (!person) return null;
-      db.prepare('DELETE FROM people WHERE id = ?').run(id);
-      return person;
+    // Mismo contrato que en Postgres (ver el comentario ahí): `atSubjectRequest`
+    // marca el borrado del ARCO, el único que deja constancia, y las dos
+    // escrituras van en una transacción para que no exista el estado
+    // intermedio. Las llaves se leen ANTES del DELETE porque la cascada se
+    // lleva las filas de `updates` y con ellas la única copia.
+    async deletePerson(id, { atSubjectRequest = false } = {}) {
+      const suppress = db.prepare(
+        'INSERT OR IGNORE INTO suppressed_external_ids (external_id) VALUES (?)'
+      );
+      const externalIdsStmt = db.prepare(
+        'SELECT DISTINCT external_id FROM updates WHERE person_id = ? AND external_id IS NOT NULL'
+      );
+      const remove = db.prepare('DELETE FROM people WHERE id = ?');
+      const run = db.transaction(() => {
+        const person = getPersonStmt.get(id);
+        if (!person) return null;
+        let suppressed = 0;
+        if (atSubjectRequest) {
+          // Se guarda el hash, nunca la llave cruda (#192, revisión de
+          // cris-pappcorn, punto 2) — ver el comentario de hashExternalId,
+          // arriba.
+          for (const row of externalIdsStmt.all(id)) {
+            suppressed += suppress.run(hashExternalId(row.external_id)).changes;
+          }
+        }
+        remove.run(id);
+        return { ...person, suppressed_external_ids: suppressed };
+      });
+
+      // Instantánea de qué llaves podría suprimir este borrado — solo para
+      // saber CUÁLES pedir; no es garantía de que sigan siendo las mismas para
+      // cuando la transacción de arriba corra. Una llave que aparezca después
+      // de esta foto no tiene lock que la proteja todavía, pero la relectura
+      // de `externalIdsStmt` YA ADENTRO de la transacción la encuentra y la
+      // suprime igual. Lo que eso no cierra —más angosto que la condición de
+      // carrera de #192— es una admisión que en ese mismo instante le agrega a
+      // ESTA MISMA persona una llave que nadie pidió suprimir todavía.
+      const snapshot = atSubjectRequest
+        ? externalIdsStmt.all(id).map((r) => r.external_id).sort()
+        : [];
+
+      // El MISMO lock que sostiene la admisión entre su chequeo y su escritura
+      // (#192) — si el borrado no lo pide antes de escribir, un re-envío que
+      // ya pasó el chequeo puede quedar en el aire mientras este borrado
+      // suprime y se va, y terminar escribiendo igual: la ficha revive.
+      return lockExternalIds(snapshot, () => run());
+    },
+    // La consulta que hace valer la constancia, en el ingreso. Por llave
+    // exacta sobre el hash (#192, revisión de cris-pappcorn, punto 2): una
+    // llave distinta para la misma persona no está suprimida, y ese es el
+    // límite honesto del mecanismo.
+    async isExternalIdSuppressed(externalId) {
+      return !!db
+        .prepare('SELECT 1 AS uno FROM suppressed_external_ids WHERE external_id = ?')
+        .get(hashExternalId(externalId));
     },
     async counts() {
       const n = (sql) => db.prepare(sql).get().n;
@@ -559,10 +764,36 @@ async function createSqliteAdapter(dbPath) {
         'INSERT INTO match_log (person_id, update_id, face_id, similarity, surface) VALUES (?, ?, ?, ?, ?)'
       ).run(personId, updateId ?? null, faceId, similarity ?? null, surface);
     },
-    async insertContactLog({ personId, updateId, channel, result }) {
-      db.prepare(
-        'INSERT INTO contact_log (person_id, update_id, channel, result) VALUES (?, ?, ?, ?)'
-      ).run(personId, updateId ?? null, channel, result);
+    // Mismo contrato que el adapter de Postgres (ver ahí los comentarios):
+    // la app escribe sin `source` y cae al default 'app'; el registrador
+    // externo pasa 'operador' + su digesto + la fecha real del contacto, y
+    // recibe `{ inserted }` para distinguir un registro nuevo de un
+    // reintento.
+    async insertContactLog({ personId, updateId, channel, result, source = 'app', externalRef = null, createdAt = null }) {
+      const info = db
+        .prepare(
+          `INSERT INTO contact_log (person_id, update_id, channel, result, source, external_ref, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, strftime('%Y-%m-%dT%H:%M:%SZ','now')))
+           ON CONFLICT (external_ref) WHERE external_ref IS NOT NULL DO NOTHING`
+        )
+        .run(personId, updateId ?? null, channel, result, source, externalRef, createdAt);
+      return { inserted: info.changes > 0 };
+    },
+    async deleteContactLogByRef(externalRef) {
+      const info = db
+        .prepare("DELETE FROM contact_log WHERE external_ref = ? AND source = 'operador'")
+        .run(externalRef);
+      return info.changes > 0;
+    },
+    async familyContactLogByPerson(personId) {
+      return db
+        .prepare(
+          `SELECT channel, result, source, created_at
+           FROM contact_log
+           WHERE person_id = ? AND channel <> 'relevo'
+           ORDER BY created_at ASC, id ASC`
+        )
+        .all(personId);
     },
     // #150: registro de cada auto-fusión por nombre — ver el comentario del
     // esquema sobre por qué esta tabla sí guarda un nombre.
@@ -571,6 +802,64 @@ async function createSqliteAdapter(dbPath) {
         'INSERT INTO merge_log (person_id, submitted_name, score) VALUES (?, ?, ?)'
       ).run(personId, submittedName, score);
     },
+    // ===== COLA DE REVISIÓN DE ESTADO (#190) — inicio =====================
+    // Todos los que están en la cola: las personas cuyo ÚLTIMO estado es
+    // `unknown`. La cola no necesita una bandera de "resuelto" — resolver
+    // escribe una fila nueva en `updates`, el último estado deja de ser
+    // `unknown` y la ficha sale de acá sola.
+    //
+    // Mismo filtro de "último estado" que missingPeople (AGGREGATOR_SAFE_
+    // EXCLUSION): sin él, esta cola y el listado público no estarían mirando
+    // el mismo estado.
+    //
+    // Devuelve la evidencia con la que se va a juzgar, no solo el nombre:
+    // message, location y source_url de esa última fila. Todo esto se muestra
+    // detrás del gate de /admin.
+    async unknownPeople(limit) {
+      return db
+        .prepare(
+          `WITH latest AS (
+             SELECT u.*,
+                    ROW_NUMBER() OVER (PARTITION BY u.person_id ORDER BY u.created_at DESC, u.id DESC) AS rn
+             FROM updates u
+             ${AGGREGATOR_SAFE_EXCLUSION}
+           )
+           SELECT p.id, p.full_name,
+                  l.id AS update_id, l.status, l.message, l.location, l.source,
+                  l.source_url, l.created_at AS last_report
+           FROM people p
+           JOIN latest l ON l.person_id = p.id AND l.rn = 1
+           WHERE l.status = 'unknown'
+           ORDER BY l.created_at DESC
+           LIMIT ?`
+        )
+        .all(limit);
+    },
+    async insertStatusReview({ personId, probableStatus, evidenceNote, author, resolved, updateId, recipients, notifyMode }) {
+      const info = db
+        .prepare(
+          `INSERT INTO status_review
+             (person_id, probable_status, evidence_note, author, resolved, update_id, recipients, notify_mode)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          personId,
+          probableStatus,
+          evidenceNote,
+          author,
+          resolved ? 1 : 0,
+          updateId ?? null,
+          Number.isFinite(recipients) ? recipients : null,
+          notifyMode ?? null
+        );
+      return db.prepare('SELECT * FROM status_review WHERE id = ?').get(info.lastInsertRowid);
+    },
+    async statusReviewsForPerson(personId) {
+      return db
+        .prepare('SELECT * FROM status_review WHERE person_id = ? ORDER BY created_at DESC, id DESC')
+        .all(personId);
+    },
+    // ===== COLA DE REVISIÓN DE ESTADO (#190) — fin ========================
     // Cuenta total y por superficie. `since` (ISO) filtra a lo escrito desde
     // ahí — se usa para la línea de "cambio desde el reporte anterior" del
     // correo operativo; sin `since`, es el acumulado histórico completo.
@@ -588,12 +877,11 @@ async function createSqliteAdapter(dbPath) {
     },
     // Una fila por (channel, result) — el correo pivotea esto en su propia
     // tabla. `since` con el mismo significado que en matchLogCounts.
-    async contactLogCounts({ since } = {}) {
-      const where = since ? 'WHERE created_at >= ?' : '';
-      const params = since ? [since] : [];
+    async contactLogCounts({ since, source = 'app' } = {}) {
+      const { clause, params } = contactLogWhere({ since, source });
       return db
         .prepare(
-          `SELECT channel, result, COUNT(*) AS count FROM contact_log ${where} GROUP BY channel, result ORDER BY channel, result`
+          `SELECT channel, result, COUNT(*) AS count FROM contact_log ${clause} GROUP BY channel, result ORDER BY channel, result`
         )
         .all(...params);
     },
@@ -621,12 +909,11 @@ async function createSqliteAdapter(dbPath) {
         )
         .all(...params);
     },
-    async contactLogDaily({ since } = {}) {
-      const where = since ? 'WHERE created_at >= ?' : '';
-      const params = since ? [since] : [];
+    async contactLogDaily({ since, source = 'app' } = {}) {
+      const { clause, params } = contactLogWhere({ since, source });
       return db
         .prepare(
-          `SELECT date(created_at, '-5 hours') AS day, result, COUNT(*) AS count FROM contact_log ${where} GROUP BY day, result ORDER BY day`
+          `SELECT date(created_at, '-5 hours') AS day, result, COUNT(*) AS count FROM contact_log ${clause} GROUP BY day, result ORDER BY day`
         )
         .all(...params);
     },
@@ -639,8 +926,9 @@ async function createSqliteAdapter(dbPath) {
       const r = db.prepare('SELECT MIN(created_at) AS min FROM match_log').get();
       return r.min || null;
     },
-    async contactLogEarliest() {
-      const r = db.prepare('SELECT MIN(created_at) AS min FROM contact_log').get();
+    async contactLogEarliest({ source = 'app' } = {}) {
+      const { clause, params } = contactLogWhere({ source });
+      const r = db.prepare(`SELECT MIN(created_at) AS min FROM contact_log ${clause}`).get(...params);
       return r.min || null;
     },
 

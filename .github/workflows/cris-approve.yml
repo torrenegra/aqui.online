@@ -180,12 +180,25 @@ jobs:
             // Un status se normaliza a la forma de un check run para que el
             // módulo de decisión no tenga que conocer las dos formas. `pending`
             // se traduce a "todavía no concluyó", que es justo lo que significa.
+            //
+            // `description` viaja también, y no es cosmética (issue #199): es
+            // el único lugar donde CodeRabbit distingue "revisó y no encontró
+            // nada" de "no revisó" — cupo agotado, PR en draft, lo que venga
+            // después. `conclusion` sola dice `success` en los dos casos. Sin
+            // este campo, `cris-decide.cjs` no tendría cómo aplicar la lista
+            // blanca que exige para ese check puntual.
             const statusesComoChecks = statuses.map((s) => ({
               name: s.context,
               status: s.state === 'pending' ? 'in_progress' : 'completed',
               conclusion: s.state === 'pending' ? null : s.state === 'success' ? 'success' : s.state,
               started_at: s.created_at,
               completed_at: s.updated_at,
+              description: s.description,
+              // Quién firmó el status. Sin esto la lista blanca de la
+              // descripción no protege nada: un commit status lo puede crear
+              // cualquier cuenta con permiso de escritura, con el `context` y
+              // el texto que quiera.
+              creator: (s.creator || {}).login,
             }));
             // El head al MOMENTO de decidir, no el congelado del payload.
             const { data: fresco } = await github.rest.pulls.get({

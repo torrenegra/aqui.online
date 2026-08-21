@@ -73,6 +73,20 @@
 /src/facematch.js            @torrenegra @ni500 @yesid-lopez
 /src/duplicates.js           @torrenegra @ni500 @yesid-lopez
 
+# Mascotas NO pasa por Rekognition: usa un servicio de embeddings propio por
+# HTTP, y es justamente por eso que esta superficie entró sin freno —los
+# patrones de arriba nombran a Rekognition y no la miran—. Pero es la misma
+# categoría: una foto que sale de este proceso hacia un tercero, y una
+# comparación que decide que dos fotos son el mismo animal. petfaces.js es el
+# análogo de faces.js, y petmatch.js el de facematch.js.
+#
+# petmatch.js se lleva además la promesa de privacidad de la superficie: el
+# borrado de la foto de quien encontró una mascota, que el código dejó a
+# propósito FUERA del try que puede fallar. Es el equivalente de RESCUE_PRIVACY
+# del lado de personas, y no tenía dónde vivir restringido.
+/src/petfaces.js             @torrenegra @ni500 @yesid-lopez
+/src/petmatch.js             @torrenegra @ni500 @yesid-lopez
+
 
 # === Privacidad y datos de contacto ========================================
 # Qué sale de un reporte hacia afuera —enmascarado o crudo— y a quién se le
@@ -81,24 +95,67 @@
 /src/privacy.js              @torrenegra @ni500 @yesid-lopez
 /src/notify.js               @torrenegra @ni500 @yesid-lopez
 
+# pets.js guarda el teléfono o el correo de quien perdió una mascota, y no
+# importa nada de privacy.js: en esa superficie no hay enmascarado de salida.
+# Es el mismo dato y el mismo riesgo que el de una familia que está buscando a
+# una persona; que del otro lado haya un animal no cambia de quién es el
+# teléfono.
+/src/pets.js                 @torrenegra @ni500 @yesid-lopez
+
+
+# === La salida de una ficha de la cola de revisión =========================
+# Acá vive el botón que cierra una ficha en SIN CONFIRMAR como A SALVO o
+# FALLECIDO(A) (#190). Dos consecuencias, y cada una alcanza sola para que la
+# decisión sea de una persona:
+#
+#   1. Cambia lo que el listado público dice de alguien. Una resolución
+#      equivocada sobre un homónimo le anuncia a una familia una muerte que no
+#      ocurrió.
+#   2. MANDA AVISOS. Resolver llama a notifySubscribers, así que este archivo
+#      le escribe a personas que están esperando noticias de un desaparecido.
+#
+# Ojo con la geografía: por ruta, este archivo caería en el catch-all, y el
+# corte por consecuencia lo trae acá. Es la clase de diferencia que CODEOWNERS
+# no puede ver por sí solo y que test/codeowners.test.js vigila.
+/src/statusReview.js         @torrenegra @ni500 @yesid-lopez
+
 
 # === La app pública ========================================================
-# INTERINO. Se relaja cuando se parta el archivo.
+# INTERINO donde el archivo siga sin partirse: cada uno se relaja el día que
+# se parta. Hasta el 19-ago-2026 este bloque restringía /src/routes/web.js
+# ENTERO (~1.600 líneas): mezclaba el copy más rutinario del sitio con las
+# cuatro piezas delicadas del flujo de rescate, y CODEOWNERS no distingue una
+# línea de otra (ver punto 3 arriba).
 #
-# web.js son ~1.600 líneas donde conviven el copy más rutinario del sitio y lo
-# más delicado que tiene el proyecto: el bloque que muestra en pantalla el
-# contacto de una familia, el relevo que lo manda por correo, la promesa de que
-# la foto no se guarda, y la casilla con la que alguien consiente que se use su
-# firma facial. Como CODEOWNERS no distingue una línea de otra (ver punto 3
-# arriba), hoy se restringe el archivo entero.
+# Ese día se partió el archivo, sin cambiar una sola línea de comportamiento
+# observable (test/codeowners.test.js y la suite completa quedaron verdes con
+# los mismos casos). De las cuatro piezas que nombraba este comentario:
+#   - matchContactBlock (pinta en pantalla el contacto de una familia),
+#   - RESCUE_PRIVACY (la promesa de que la foto no se guarda),
+#   - searchOnlyCheckbox (la casilla de consentimiento sobre la firma facial),
+#     salieron a src/rescue-contact.js, restringido abajo.
+#   - relayToOperators / notifySubscribers (el relevo que manda el aviso por
+#     correo) YA vivían en src/notify.js, restringido más arriba — no se
+#     movieron.
 #
-# El precio se paga en velocidad: es el archivo que más se toca del repo, así
-# que un arreglo de copy o de layout queda esperando a una persona sin
-# necesitarlo. Sumar un tercer revisor alivia la espera, pero NO paga la deuda:
-# la salida sigue siendo sacar esas cuatro piezas a su propio módulo y devolver
-# web.js a lo rutinario. Ese refactor no cambia comportamiento observable, así
-# que es rutinario y no necesita esperar a nadie.
-/src/routes/web.js           @torrenegra @ni500 @yesid-lopez
+# /src/routes/web.js vuelve a caer en el catch-all `*`: es el archivo que más
+# se toca del repo, así que un arreglo de copy o de layout ya no espera a una
+# de tres personas sin necesitarlo.
+/src/rescue-contact.js       @torrenegra @ni500 @yesid-lopez
+
+# routes/pets.js entra acá por la misma razón y con el mismo carácter INTERINO.
+# El bloque que le muestra el contacto del dueño a quien completa una
+# comparación vive ahí, mezclado con el copy, los formularios y el layout de
+# toda la superficie de mascotas. Como CODEOWNERS no distingue una línea de
+# otra (punto 3 arriba), hoy se restringe el archivo entero.
+#
+# Y hay que decir el precio de frente, porque es el mismo de web.js y va a
+# doler igual: es el archivo que más se va a tocar de la superficie de
+# mascotas, así que un arreglo de copy o de layout va a quedar esperando a una
+# persona sin necesitarlo. La salida también es la misma: sacar ese bloque a su
+# propio módulo y devolver routes/pets.js a lo rutinario. Ese refactor no
+# cambia comportamiento observable, así que es rutinario y no espera a nadie.
+/src/routes/pets.js          @torrenegra @ni500 @yesid-lopez
 
 
 # === Superficie pública y despliegue =======================================

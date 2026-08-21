@@ -42,7 +42,14 @@ function pr(overrides = {}) {
     reviews: [],
     checkRuns: [
       { name: 'npm test', status: 'completed', conclusion: 'success', started_at: '2026-08-15T10:00:00Z' },
-      { name: 'CodeRabbit', status: 'completed', conclusion: 'success', started_at: '2026-08-15T10:00:00Z' },
+      {
+        name: 'CodeRabbit',
+        status: 'completed',
+        conclusion: 'success',
+        started_at: '2026-08-15T10:00:00Z',
+        description: 'Review completed',
+        creator: 'coderabbitai',
+      },
     ],
     ...overrides,
   };
@@ -177,6 +184,69 @@ test('el gate acepta a CodeRabbit, que llega como commit status y no como check 
   assert.match(sinCodeRabbit.reason, /CodeRabbit/);
 });
 
+// ── La lista blanca de CodeRabbit (issue #199) ──────────────────────────────
+//
+// `conclusion: 'success'` no basta para este check puntual: CodeRabbit lo
+// reporta igual cuando revisó y no encontró nada que cuando NO revisó —cupo
+// agotado, PR en draft, y lo que aparezca después—. La única defensa es exigir
+// que `description` AFIRME la revisión, en vez de descartar las causas de
+// fallo que ya conocemos. Por eso los cuatro casos de abajo: el sano, las dos
+// causas medidas en PRs reales el mismo día, y una tercera inventada — esa
+// última es la que de verdad separa una lista blanca de una negra. Si solo se
+// probaran las dos causas conocidas, un refactor que las volviera un
+// blacklist pasaría estas mismas pruebas y el hueco del issue seguiría
+// abierto.
+function coderabbitStatus(description, creator = 'coderabbitai') {
+  return {
+    name: 'CodeRabbit',
+    status: 'completed',
+    conclusion: 'success',
+    started_at: '2026-08-15T10:00:00Z',
+    description,
+    creator,
+  };
+}
+const NPM_TEST_OK = {
+  name: 'npm test',
+  status: 'completed',
+  conclusion: 'success',
+  started_at: '2026-08-15T10:00:00Z',
+};
+
+test('CodeRabbit "Review completed": afirma la revisión, pasa', () => {
+  const d = decide(pr({ checkRuns: [NPM_TEST_OK, coderabbitStatus('Review completed')] }));
+  assert.equal(d.decision, 'approve_and_merge');
+});
+
+test('CodeRabbit "Review rate limited": success sin haber revisado, aborta (caso real #186)', () => {
+  const d = decide(pr({ checkRuns: [NPM_TEST_OK, coderabbitStatus('Review rate limited')] }));
+  assert.equal(d.decision, 'abort');
+  assert.match(d.reason, /CodeRabbit/);
+  // El `reason` tiene que decir la descripción EXACTA que encontró, para que
+  // quien lea el log sepa si fue una causa real o un falso positivo de la
+  // lista blanca — no basta con saber que abortó.
+  assert.match(d.reason, /Review rate limited/);
+});
+
+test('CodeRabbit "Review skipped: draft pull request": success sin haber revisado, aborta (caso real #201)', () => {
+  const d = decide(pr({ checkRuns: [NPM_TEST_OK, coderabbitStatus('Review skipped: draft pull request')] }));
+  assert.equal(d.decision, 'abort');
+  assert.match(d.reason, /CodeRabbit/);
+  assert.match(d.reason, /Review skipped: draft pull request/);
+});
+
+test('CodeRabbit con una descripción desconocida e inventada TAMBIÉN aborta: la lista es BLANCA, no negra', () => {
+  // La prueba que de verdad distingue las dos estrategias. Una lista NEGRA
+  // con solo las dos causas de arriba dejaría pasar este texto porque no
+  // está en su catálogo de excusas conocidas. La lista BLANCA lo detiene
+  // igual, porque nunca afirmó lo único que hace falta: que la revisión
+  // ocurrió sobre este diff.
+  const d = decide(pr({ checkRuns: [NPM_TEST_OK, coderabbitStatus('Review postponed: quota reshuffled by provider')] }));
+  assert.equal(d.decision, 'abort');
+  assert.match(d.reason, /CodeRabbit/);
+  assert.match(d.reason, /Review postponed: quota reshuffled by provider/);
+});
+
 test('los owners NO se acumulan entre reglas: el catch-all no posee lo restringido', () => {
   // Es la línea de la que cuelga todo el reparto. Si `ownersOf` acumulara, el
   // agente —que está en `*`— sería owner del esquema de la base.
@@ -192,7 +262,14 @@ test('un check en rojo aborta', () => {
     pr({
       checkRuns: [
         { name: 'npm test', status: 'completed', conclusion: 'failure', started_at: '2026-08-15T10:00:00Z' },
-        { name: 'CodeRabbit', status: 'completed', conclusion: 'success', started_at: '2026-08-15T10:00:00Z' },
+        {
+        name: 'CodeRabbit',
+        status: 'completed',
+        conclusion: 'success',
+        started_at: '2026-08-15T10:00:00Z',
+        description: 'Review completed',
+        creator: 'coderabbitai',
+      },
       ],
     })
   );
@@ -214,7 +291,14 @@ test('gana la última corrida CONCLUIDA, no la última empezada', () => {
       checkRuns: [
         { name: 'npm test', status: 'completed', conclusion: 'success', started_at: '2026-08-15T10:00:00Z' },
         { name: 'npm test', status: 'queued', started_at: '2026-08-15T11:00:00Z' },
-        { name: 'CodeRabbit', status: 'completed', conclusion: 'success', started_at: '2026-08-15T10:00:00Z' },
+        {
+        name: 'CodeRabbit',
+        status: 'completed',
+        conclusion: 'success',
+        started_at: '2026-08-15T10:00:00Z',
+        description: 'Review completed',
+        creator: 'coderabbitai',
+      },
       ],
     })
   );
@@ -227,7 +311,14 @@ test('si la última concluida es roja, una corrida en vuelo no la rescata', () =
       checkRuns: [
         { name: 'npm test', status: 'completed', conclusion: 'failure', started_at: '2026-08-15T10:00:00Z' },
         { name: 'npm test', status: 'in_progress', started_at: '2026-08-15T11:00:00Z' },
-        { name: 'CodeRabbit', status: 'completed', conclusion: 'success', started_at: '2026-08-15T10:00:00Z' },
+        {
+        name: 'CodeRabbit',
+        status: 'completed',
+        conclusion: 'success',
+        started_at: '2026-08-15T10:00:00Z',
+        description: 'Review completed',
+        creator: 'coderabbitai',
+      },
       ],
     })
   );
@@ -283,4 +374,49 @@ test('la firma de un bot no es juicio humano, y la del propio agente no cuenta',
     CRIS
   );
   assert.equal(vivos.size, 0);
+});
+
+// ── Quién FIRMA el status, que es la mitad que faltaba ──────────────────────
+//
+// La lista blanca de la descripción no protege nada por sí sola: un commit
+// status NO es un check run — lo puede crear cualquier cuenta con permiso de
+// escritura, con el `context` y la `description` que quiera. Preguntarle a un
+// desconocido si revisó no vale más que su palabra.
+
+test('un status «CodeRabbit» firmado por otra cuenta no cuenta como revisión', () => {
+  const d = decide(
+    pr({ checkRuns: [NPM_TEST_OK, coderabbitStatus('Review completed', 'alguien-con-push')] })
+  );
+  assert.equal(d.decision, 'abort');
+  // El motivo tiene que nombrar al emisor: quien lea el log necesita saber
+  // QUIÉN lo firmó, no solo que se rechazó.
+  assert.match(d.reason, /alguien-con-push/);
+});
+
+test('un status sin emisor identificable tampoco pasa', () => {
+  // Se borra la propiedad en vez de pasar `undefined`: pasarlo activaría el
+  // valor por defecto del parámetro y la prueba mediría lo contrario de lo que
+  // dice su nombre. Es el caso de una API que no devuelve `creator`.
+  const sinEmisor = coderabbitStatus('Review completed');
+  delete sinEmisor.creator;
+  const d = decide(pr({ checkRuns: [NPM_TEST_OK, sinEmisor] }));
+  assert.equal(d.decision, 'abort');
+});
+
+test('se acepta la forma con sufijo [bot], porque GitHub reporta las Apps así', () => {
+  // Cuál de las dos formas llega depende de si el status lo creó la App o su
+  // cuenta asociada, y ninguna es menos legítima que la otra.
+  const d = decide(
+    pr({ checkRuns: [NPM_TEST_OK, coderabbitStatus('Review completed', 'coderabbitai[bot]')] })
+  );
+  assert.equal(d.decision, 'approve_and_merge');
+});
+
+test('el emisor se valida ANTES que la descripción', () => {
+  // Si el orden se invirtiera, el motivo del rechazo hablaría de la
+  // descripción de un impostor — como si su texto fuera el problema y no su
+  // identidad.
+  const d = decide(pr({ checkRuns: [NPM_TEST_OK, coderabbitStatus('Review rate limited', 'impostor')] }));
+  assert.equal(d.decision, 'abort');
+  assert.match(d.reason, /impostor/);
 });

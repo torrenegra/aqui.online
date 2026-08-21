@@ -2,16 +2,65 @@
 // Uses pg_trgm (when available) to prefilter fuzzy-search candidates with an index;
 // the shared JS scorer in people.js does the final ranking.
 const { Pool } = require('pg');
+const crypto = require('crypto');
 
 // #78: see the same constant in src/store/sqlite.js for why "latest status"
 // must treat an aggregator-sourced 'safe' row as if it were never written.
 const AGGREGATOR_SAFE_EXCLUSION = `WHERE NOT (u.source = 'aggregator' AND u.status = 'safe')`;
 
+// La llave que se guarda en suppressed_external_ids nunca es el valor crudo
+// (#192, revisión de cris-pappcorn, punto 2): la llave la elige quien empuja,
+// y hay integradores que usan el nombre completo de la persona como
+// external_id cuando la fuente no trae otro identificador. Guardar el hash
+// mantiene la misma garantía de bloqueo — la comparación sigue siendo por
+// igualdad exacta, sha256(a) === sha256(b) sii a === b — sin dejar un dato
+// personal en la única tabla del esquema que a propósito no se borra nunca.
+function hashExternalId(externalId) {
+  return crypto.createHash('sha256').update(String(externalId), 'utf8').digest('hex');
+}
+
 async function createPostgresAdapter(connectionString) {
+  const sslConfig = /localhost|127\.0\.0\.1/.test(connectionString)
+    ? undefined
+    : { rejectUnauthorized: false };
+
   const pool = new Pool({
     connectionString,
     max: 3, // serverless: keep pools tiny
-    ssl: /localhost|127\.0\.0\.1/.test(connectionString) ? undefined : { rejectUnauthorized: false }
+    ssl: sslConfig
+  });
+
+  // Pool APARTE, chico, solo para sostener un advisory lock TRANSACCIONAL
+  // mientras corre la sección crítica que protege (#192) — NUNCA `pool`.
+  //
+  // Dos consumidores, la misma razón:
+  //   - `withExternalIdLock`: `fn` corre los métodos normales del store, que
+  //     a su vez hacen `pool.query(...)` en conexiones del pool de arriba; si
+  //     la conexión que sostiene el lock viniera de esa MISMA fuente, bastaban
+  //     tres admisiones concurrentes de llaves distintas (o tres esperas del
+  //     mismo advisory lock) para dejar las tres conexiones de `pool`
+  //     ocupadas sosteniendo/esperando el lock, sin ninguna libre para que
+  //     `fn` corriera su propio isExternalIdSuppressed/findOrCreatePerson/
+  //     insertUpdate — un deadlock del pool entero, no solo de esta llave
+  //     (hallazgo de QA).
+  //   - `deletePerson` (a solicitud): sostiene el MISMO tipo de lock mientras
+  //     su propia transacción corre. Si tomara su conexión de `pool` (como
+  //     hacía antes de la revisión de cris-pappcorn, punto 3), varios DELETE
+  //     concurrentes esperando un lock que sostiene una admisión en curso —
+  //     cuyo `fn` necesita, a su vez, conexiones de `pool` — podían agotarlo
+  //     entre los dos lados. `deletePerson` no reentra a `pool` mientras
+  //     sostiene su conexión (solo corre sus propias queries en el mismo
+  //     client), así que moverlo acá no crea el mismo problema en sentido
+  //     contrario.
+  //
+  // Un pool separado hace que sostener cualquiera de los dos locks JAMÁS le
+  // quite una conexión a lo que el otro lado necesita: la única cola posible
+  // es la de este pool chico esperando a que otra sección crítica termine —
+  // más lento bajo mucha concurrencia, nunca trabado para siempre.
+  const lockPool = new Pool({
+    connectionString,
+    max: 2, // igual de chico; ver el porqué arriba
+    ssl: sslConfig
   });
 
   let hasTrgm = false;
@@ -101,16 +150,72 @@ async function createPostgresAdapter(connectionString) {
     CREATE INDEX IF NOT EXISTS idx_match_log_person ON match_log(person_id);
     CREATE INDEX IF NOT EXISTS idx_match_log_created ON match_log(created_at);
 
+    -- La columna "source" dice QUIÉN ejecutó el contacto, no por qué medio
+    -- (eso es "channel"). 'app' es todo lo que escribe esta aplicación; 'operador'
+    -- es un contacto que una persona del equipo hizo POR FUERA de la app,
+    -- desde su propio buzón o su propio teléfono, y que se registra después
+    -- por POST /api/contact-log. Son dos hechos distintos y no se pueden
+    -- sumar: la serie de 'app' es el instrumento con el que se responde
+    -- "¿el relevo está reteniendo?" y "¿la app entregó?", y una fila que la
+    -- app nunca envió la vuelve incontestable. Por eso TODAS las funciones
+    -- de agregado de abajo filtran por source y su valor por omisión es
+    -- 'app' — olvidar el parámetro conserva el significado de siempre.
+    --
+    -- "external_ref" es la llave de idempotencia del registrador externo: un
+    -- DIGESTO (SHA-256 en hex) del id de mensaje del proveedor, nunca el id
+    -- crudo. Un wamid de WhatsApp lleva el teléfono del destinatario
+    -- codificado en base64: guardarlo acá metería el número de una familia
+    -- en esta tabla, que es justo lo que su diseño prohíbe. La ruta valida
+    -- la forma del digesto, así que un id crudo no puede entrar aunque
+    -- alguien lo intente.
     CREATE TABLE IF NOT EXISTS contact_log (
       id SERIAL PRIMARY KEY,
       person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
       update_id INTEGER REFERENCES updates(id) ON DELETE CASCADE,
       channel TEXT NOT NULL CHECK (channel IN ('email','whatsapp','relevo')),
       result TEXT NOT NULL CHECK (result IN ('enviado','fallido','rechazado')),
+      source TEXT NOT NULL DEFAULT 'app' CHECK (source IN ('app','operador')),
+      external_ref TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS idx_contact_log_person ON contact_log(person_id);
     CREATE INDEX IF NOT EXISTS idx_contact_log_created ON contact_log(created_at);
+
+    -- Constancia de que una ficha se borró a solicitud de la persona misma
+    -- (#191), y el mecanismo que hace durable ese borrado. Es la única tabla
+    -- del esquema que a propósito NO cuelga de people(id): su trabajo es
+    -- justamente sobrevivir a la fila.
+    --
+    -- Sin ella el borrado se deshace solo. El ON CONFLICT (external_id) de
+    -- insertUpdate es lo que hace idempotente a un re-envío, y necesita que la
+    -- fila exista para chocar con ella; borrada la ficha, un re-envío de la
+    -- misma no actualiza nada: inserta de nuevo, y processPhoto le reindexa la
+    -- cara. Sin log, sin error y sin contador — para el sistema es una ficha
+    -- nueva que entró bien.
+    --
+    -- Guarda el HASH sha256 de la llave (hex, 64 caracteres) y la fecha, y
+    -- nada más: ni nombre, ni foto, ni contacto, ni person_id, ni la llave
+    -- cruda. La llave la elige quien empuja, y hay integradores que usan el
+    -- nombre completo de la persona como external_id cuando la fuente no
+    -- trae otro identificador — guardar el hash evita que alguien que ejerce
+    -- su derecho de supresión termine con su nombre en claro, a perpetuidad,
+    -- en la única tabla del esquema sin retención. El chequeo sigue siendo
+    -- por igualdad exacta (sha256(a) === sha256(b) sii a === b), así que la
+    -- garantía de bloqueo no cambia. El punto es impedir que la ficha vuelva,
+    -- no poder reconstruir lo que se borró. Por eso tampoco hay una columna
+    -- de "motivo" en texto libre: sería otra puerta por la que entraría PII a
+    -- esta tabla.
+    --
+    -- El alcance es la MISMA llave externa y nada más. Un reporte sin
+    -- external_id —el formulario web, el bot— no se bloquea jamás, ni siquiera
+    -- si es sobre la misma persona: si una familia la reporta de verdad más
+    -- adelante, impedírselo sería peor que el problema que esto cierra. Lo que
+    -- se suprime es la re-entrada automática de una ficha, no el derecho de
+    -- nadie a reportar.
+    CREATE TABLE IF NOT EXISTS suppressed_external_ids (
+      external_id TEXT PRIMARY KEY,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
 
     CREATE TABLE IF NOT EXISTS pets (
       id SERIAL PRIMARY KEY,
@@ -166,6 +271,85 @@ async function createPostgresAdapter(connectionString) {
     );
     CREATE INDEX IF NOT EXISTS idx_merge_log_person ON merge_log(person_id);
     CREATE INDEX IF NOT EXISTS idx_merge_log_created ON merge_log(created_at);
+
+    -- ===== COLA DE REVISIÓN DE ESTADO (#190) — inicio =====================
+    -- Una ficha en unknown no tiene salida, y eso es el issue #190: el
+    -- adaptador del registro público manda "Localizada sin vida" a unknown
+    -- A PROPÓSITO (src/sources/colombiatebusca.js) porque adivinar sobre la
+    -- muerte de alguien no se hace solo — y el efecto es que la ficha se queda
+    -- publicada como buscada indefinidamente aunque la confirmación exista.
+    -- Esta tabla es la constancia de la salida humana: quién decidió, cuándo,
+    -- y con qué evidencia.
+    --
+    -- Por qué NO hay un estado público nuevo. Se propuso "probablemente
+    -- encontrado" y se descartó por dos razones que gobiernan todo el diseño:
+    -- (a) unknown YA es ese estacionamiento, y un segundo duplicaría el
+    -- problema de la cola en vez de resolverlo; (b) un estado público es un
+    -- mensaje a una familia — si una madre lee "probablemente encontrado" en
+    -- la ficha de su hijo va a leer esperanza, y si era un homónimo esa
+    -- crueldad la causamos nosotros.
+    --
+    -- Por eso el marcador de "probable" vive ACÁ y es PRIVADO. Ninguna
+    -- superficie pública lee esta tabla, y publicUpdate (src/privacy.js)
+    -- enumera campo por campo lo que sale de una fila de updates, así que
+    -- nada de acá puede filtrarse por una copia en bloque.
+    --
+    -- Dos clases de fila, distinguidas por resolved:
+    --   resolved = false  constancia sin efecto: alguien miró la ficha y dejó
+    --                     escrito qué encontró. NO cambia el estado público y
+    --                     NO manda ningún aviso.
+    --   resolved = true   resolución aplicada: se escribió una fila en
+    --                     updates (update_id) y de ahí salieron los avisos.
+    --
+    -- author es el correo de la sesión de /admin. Es el único lugar del
+    -- esquema donde se persiste la identidad de un operador, y es deliberado:
+    -- sin eso la cola es un botón sin memoria. Es dato personal del EQUIPO,
+    -- no de una persona reportada ni de su familia, y hereda la misma
+    -- retención que todo lo demás.
+    --
+    -- El enlace a la noticia NO se guarda acá: va en updates.source_url,
+    -- que ya existe justamente para eso. Esta tabla guarda la DECISIÓN, no
+    -- los links.
+    --
+    -- evidence_note es la justificación privada de quien revisó, y NUNCA se
+    -- copia a updates.message: message sí sale al público.
+    --
+    -- Nada de "cuándo alcanza la evidencia" está codificado acá. El criterio
+    -- lo está escribiendo el frente de verificación; esta tabla registra la
+    -- evidencia y deja juzgar a la persona. Una regla de umbral incrustada en
+    -- el esquema quedaría obsoleta y sería la más difícil de cambiar.
+    --
+    -- created_at va como TEXTO ISO en los dos motores, con el mismo formato
+    -- por defecto en cada uno: un TIMESTAMPTZ vuelve como Date acá y como
+    -- string en SQLite, y esa diferencia se cuela en producción y no en las
+    -- pruebas.
+    --
+    -- Retención: hereda la del resto del esquema, ON DELETE CASCADE sobre
+    -- people(id). update_id es SET NULL y no CASCADE a propósito — la
+    -- constancia de una decisión no debe desaparecer porque se borró la fila
+    -- a la que apuntaba; desaparece con la persona, que es la regla.
+    CREATE TABLE IF NOT EXISTS status_review (
+      id SERIAL PRIMARY KEY,
+      person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+      probable_status TEXT NOT NULL CHECK (probable_status IN ('safe','deceased')),
+      evidence_note TEXT NOT NULL,
+      author TEXT NOT NULL,
+      resolved BOOLEAN NOT NULL DEFAULT false,
+      update_id INTEGER REFERENCES updates(id) ON DELETE SET NULL,
+      -- Cuántos suscriptores notificables había cuando la persona decidió: el
+      -- MISMO número que la pantalla le mostró antes de confirmar. El
+      -- resultado real de cada envío ya vive en contact_log.
+      recipients INTEGER,
+      -- En qué modo salió el aviso: 'direct' le llega al suscriptor,
+      -- 'relay' cae en el buzón de operación marcado [RETENIDO] y no sale
+      -- nada a terceros (ver notifyMode en src/notify.js). Sin esta columna,
+      -- el registro no dice si la familia se enteró o no.
+      notify_mode TEXT CHECK (notify_mode IN ('direct','relay')),
+      created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'utc', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+    );
+    CREATE INDEX IF NOT EXISTS idx_status_review_person ON status_review(person_id);
+    CREATE INDEX IF NOT EXISTS idx_status_review_created ON status_review(created_at);
+    -- ===== COLA DE REVISIÓN DE ESTADO (#190) — fin ========================
   `);
   if (hasTrgm) {
     await pool.query(`
@@ -229,8 +413,65 @@ async function createPostgresAdapter(connectionString) {
         CHECK (source IN ('web','whatsapp','api','aggregator','rescate'))
   `);
 
+  // Bases creadas antes de que contact_log distinguiera QUIÉN contactó: las
+  // filas que ya existen son todas de la app, y ese es exactamente el DEFAULT
+  // — el backfill de la columna no necesita decisión de nadie porque no
+  // afirma nada nuevo sobre ninguna persona. El CHECK va en el mismo patrón
+  // DROP+ADD de un solo ALTER que arriba, por la misma razón de arranque
+  // concurrente.
+  await pool.query("ALTER TABLE contact_log ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'app'");
+  await pool.query('ALTER TABLE contact_log ADD COLUMN IF NOT EXISTS external_ref TEXT');
+  await pool.query(`
+    ALTER TABLE contact_log
+      DROP CONSTRAINT IF EXISTS contact_log_source_check,
+      ADD  CONSTRAINT contact_log_source_check
+        CHECK (source IN ('app','operador'))
+  `);
+  // Índice único PARCIAL, igual que updates.external_id: es lo que vuelve
+  // idempotente el registro externo (reintentar no duplica) y lo que permite
+  // deshacer una fila puntual por su referencia. Las filas de la app llevan
+  // external_ref NULL y no entran al índice.
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_contact_log_external_ref
+      ON contact_log(external_ref) WHERE external_ref IS NOT NULL
+  `);
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_contact_log_source ON contact_log(source, created_at)');
+
   const one = async (sql, params) => (await pool.query(sql, params)).rows[0];
   const all = async (sql, params) => (await pool.query(sql, params)).rows;
+
+  // El WHERE compartido por los tres agregados de contact_log, en un solo
+  // sitio para que el filtro por `source` no se pueda aplicar en dos y
+  // olvidar en el tercero — que es exactamente cómo una serie empieza a
+  // contradecir a la de al lado. `source: null` significa "todas las
+  // procedencias" y hay que pedirlo explícitamente.
+  function contactLogWhere({ since, source } = {}) {
+    const conds = [];
+    const params = [];
+    if (since) {
+      params.push(since);
+      conds.push(`created_at >= $${params.length}`);
+    }
+    if (source) {
+      params.push(source);
+      conds.push(`source = $${params.length}`);
+    }
+    return { clause: conds.length ? `WHERE ${conds.join(' AND ')}` : '', params };
+  }
+
+  // Las firmas faciales atadas a una o más suscripciones. Hay que leerlas
+  // ANTES de borrar la suscripción: `photos.subscription_id` también cascada
+  // (ver el esquema arriba), y con la suscripción se va la única fila que
+  // decía qué firma retirar de Rekognition — el mismo problema que
+  // `faceIdsForPerson` ya resuelve para el borrado de persona (#162).
+  async function faceIdsForSubscriptionIds(subscriptionIds) {
+    if (!subscriptionIds.length) return [];
+    const rows = await all(
+      'SELECT face_id FROM photos WHERE subscription_id = ANY($1) AND face_id IS NOT NULL',
+      [subscriptionIds]
+    );
+    return rows.map((r) => r.face_id);
+  }
 
   return {
     async insertPerson(fullName, normalized, phonetic) {
@@ -400,22 +641,40 @@ async function createPostgresAdapter(connectionString) {
         token
       ]);
     },
+    // Igual que deletePerson en src/routes/api.js: los face_id se leen ANTES
+    // de borrar la fila, porque la cascada de subscription_id se la lleva
+    // junto con la única forma de saber qué firma retirar (#162).
     async deleteSubscriptionByToken(token) {
-      return one('DELETE FROM subscriptions WHERE verify_token = $1 RETURNING *', [token]);
+      const sub = await one('SELECT * FROM subscriptions WHERE verify_token = $1', [token]);
+      if (!sub) return null;
+      const faceIds = await faceIdsForSubscriptionIds([sub.id]);
+      await pool.query('DELETE FROM subscriptions WHERE id = $1', [sub.id]);
+      return { ...sub, faceIds };
     },
     async deleteSubscription(personId, channel, address) {
-      const r = await pool.query(
-        'DELETE FROM subscriptions WHERE person_id = $1 AND channel = $2 AND address = $3',
+      const sub = await one(
+        'SELECT id FROM subscriptions WHERE person_id = $1 AND channel = $2 AND address = $3',
         [personId, channel, address]
       );
-      return r.rowCount;
+      if (!sub) return { count: 0, faceIds: [] };
+      const faceIds = await faceIdsForSubscriptionIds([sub.id]);
+      const r = await pool.query('DELETE FROM subscriptions WHERE id = $1', [sub.id]);
+      return { count: r.rowCount, faceIds };
     },
     async deleteSubscriptionsForAddress(channel, address) {
-      const r = await pool.query('DELETE FROM subscriptions WHERE channel = $1 AND address = $2', [
+      const subs = await all('SELECT id FROM subscriptions WHERE channel = $1 AND address = $2', [
         channel,
         address
       ]);
-      return r.rowCount;
+      if (!subs.length) return { count: 0, faceIds: [] };
+      const ids = subs.map((s) => s.id);
+      const faceIds = await faceIdsForSubscriptionIds(ids);
+      // Por id, no por (channel, address): una suscripción creada entre el
+      // SELECT de arriba y este DELETE no está en `ids`, así que este WHERE no
+      // debe alcanzarla — si la alcanzara, se borraría sin haber leído su
+      // face_id, el mismo hueco que cierra el resto de este archivo (#162).
+      const r = await pool.query('DELETE FROM subscriptions WHERE id = ANY($1)', [ids]);
+      return { count: r.rowCount, faceIds };
     },
     async subscriptionsForPerson(personId) {
       return all('SELECT * FROM subscriptions WHERE person_id = $1', [personId]);
@@ -531,8 +790,190 @@ async function createPostgresAdapter(connectionString) {
       );
       return rows.map((r) => r.face_id);
     },
-    async deletePerson(id) {
-      return one('DELETE FROM people WHERE id = $1 RETURNING *', [id]);
+    // `atSubjectRequest` distingue los dos borrados que hoy existen, y la
+    // diferencia no es de forma sino de consecuencia. El del ARCO
+    // (DELETE /api/people/:id) es alguien ejerciendo un derecho, y ahí borrar
+    // ES suprimir: queda constancia de la llave para que la ficha no vuelva a
+    // entrar sola. La purga de registros de prueba borra filas que nadie pidió
+    // borrar, así que no suprime nada — bloquear para siempre la llave de un
+    // registro de prueba sería un efecto que nadie pidió.
+    //
+    // Las dos escrituras van en UNA transacción porque las dos mitades sueltas
+    // fallan distinto y las dos fallan mal: constancia sin borrado rechazaría
+    // los re-envíos de una ficha que sigue publicada y viva, y borrado sin
+    // constancia es exactamente el defecto que esto cierra.
+    //
+    // Las llaves se leen ANTES del DELETE por la misma razón que los face_id
+    // (ver faceIdsForPerson arriba): la cascada se lleva las filas de `updates`
+    // y con ellas la única copia de la llave.
+    async deletePerson(id, { atSubjectRequest = false } = {}) {
+      // Instantánea de qué llaves podría suprimir este borrado — solo para
+      // saber CUÁLES pedir con pg_advisory_xact_lock antes de escribir; no es
+      // garantía de que sigan siendo las mismas para cuando la transacción de
+      // abajo corra. Una llave que aparezca después de esta foto no tiene lock
+      // que la proteja todavía, pero la relectura de más abajo, YA ADENTRO de
+      // la transacción, la vuelve a leer y la suprime igual. Lo que eso no
+      // cierra —más angosto que la condición de carrera de #192, que es la
+      // que este lock existe para cerrar— es una admisión que en ese mismo
+      // instante le agrega a ESTA MISMA persona una llave que nadie pidió
+      // suprimir todavía.
+      const snapshot = atSubjectRequest
+        ? (
+            await pool.query(
+              'SELECT DISTINCT external_id FROM updates WHERE person_id = $1 AND external_id IS NOT NULL',
+              [id]
+            )
+          ).rows.map((r) => r.external_id).sort()
+        : [];
+
+      // La conexión dedicada sale de `lockPool`, NUNCA de `pool` (#192,
+      // revisión de cris-pappcorn, punto 3) — ver el comentario largo donde
+      // se crea `lockPool`, arriba.
+      const client = await lockPool.connect();
+      try {
+        await client.query('BEGIN');
+        // Convierte una espera patológica en un error, en vez de un cuelgue
+        // sin límite — mismo razonamiento que en withExternalIdLock, abajo.
+        // SET LOCAL es de alcance transaccional: sí funciona detrás de un
+        // pooler en modo transacción (SET a secas, no).
+        await client.query("SET LOCAL lock_timeout = '5s'");
+        // El MISMO lock que sostiene la admisión entre su chequeo y su
+        // escritura (#192, `withExternalIdLock` abajo) — si el borrado no lo
+        // pide antes de escribir, un re-envío que ya pasó el chequeo puede
+        // quedar en el aire mientras este borrado suprime y se va, y terminar
+        // escribiendo igual: la ficha revive.
+        //
+        // pg_advisory_xact_lock, no pg_advisory_lock (revisión de
+        // cris-pappcorn, punto 1): un lock de SESIÓN no sobrevive a un pooler
+        // en modo transacción (PgBouncer / el endpoint pooled de Neon, que es
+        // el que ve `findPostgresUrl()` — ver el comentario largo en
+        // withExternalIdLock) — cada sentencia suelta puede repartirse en un
+        // backend distinto, y el lock queda tomado para siempre en uno que ya
+        // nadie va a liberar. El de transacción se toma y se libera en el
+        // MISMO backend porque todo esto es una sola transacción, y se libera
+        // SOLO al COMMIT o ROLLBACK — también si el proceso muere a mitad.
+        //
+        // Van todos en la MISMA conexión que el resto de esta transacción (no
+        // una por llave): el `for` no reentra a ningún otro pool.
+        //
+        // `hashtextextended(_, 0)` da 64 bits en vez de los 32 de `hashtext`:
+        // baja la probabilidad de colisión entre llaves distintas que no
+        // tenían nada que ver entre sí. Tiene que usar la MISMA forma que
+        // `withExternalIdLock` — son espacios de lock distintos, y media
+        // migración no serializa nada.
+        for (const externalId of snapshot) {
+          await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [externalId]);
+        }
+        let suppressed = 0;
+        if (atSubjectRequest) {
+          // Relectura fresca, YA ADENTRO de la transacción — ver el
+          // comentario de `snapshot`, arriba. Se hashea en JS antes de
+          // guardar (#192, revisión de cris-pappcorn, punto 2: ver el
+          // comentario de la tabla, más arriba, para el porqué).
+          const fresh = (
+            await client.query(
+              'SELECT DISTINCT external_id FROM updates WHERE person_id = $1 AND external_id IS NOT NULL',
+              [id]
+            )
+          ).rows.map((r) => r.external_id);
+          if (fresh.length) {
+            const res = await client.query(
+              `INSERT INTO suppressed_external_ids (external_id)
+               SELECT * FROM unnest($1::text[])
+               ON CONFLICT (external_id) DO NOTHING`,
+              [fresh.map(hashExternalId)]
+            );
+            suppressed = res.rowCount || 0;
+          }
+        }
+        const deleted = (await client.query('DELETE FROM people WHERE id = $1 RETURNING *', [id]))
+          .rows[0];
+        await client.query('COMMIT');
+        return deleted ? { ...deleted, suppressed_external_ids: suppressed } : null;
+      } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw e;
+      } finally {
+        // Nada que liberar a mano: un lock transaccional se suelta solo en el
+        // COMMIT o el ROLLBACK de arriba. El pg_advisory_unlock_all() que
+        // había acá antes de la revisión de cris-pappcorn (punto 1) liberaba
+        // TODOS los locks de sesión del backend donde cayera la conexión —
+        // incluidos los de otro cliente lógico que compartiera ese backend a
+        // través del pooler — rompiendo su exclusión mutua sin ningún
+        // síntoma.
+        client.release();
+      }
+    },
+    // La consulta que hace valer la constancia, en el ingreso. Va por llave
+    // exacta sobre el hash (#192, revisión de cris-pappcorn, punto 2): una
+    // llave distinta para la misma persona no está suprimida, y eso es el
+    // límite honesto de este mecanismo (ver el comentario de la tabla).
+    async isExternalIdSuppressed(externalId) {
+      const r = await one('SELECT 1 FROM suppressed_external_ids WHERE external_id = $1', [
+        hashExternalId(externalId)
+      ]);
+      return !!r;
+    },
+    // Lock TRANSACCIONAL por external_id: serializa el chequeo-y-escritura de
+    // una admisión (src/report-admission.js) contra la ventana en la que
+    // `deletePerson({ atSubjectRequest: true })` suprime esa misma llave
+    // (#192, condición de carrera señalada por coderabbitai).
+    //
+    // Es `pg_advisory_xact_lock`, no `pg_advisory_lock` (revisión de
+    // cris-pappcorn, punto 1, confirmada leyendo `src/store/index.js`, no
+    // adivinada): `findPostgresUrl()` acepta seis nombres de variable y
+    // ninguno de los dos que apuntan al endpoint DIRECTO de Neon
+    // (`DATABASE_URL_UNPOOLED`, `POSTGRES_URL_NON_POOLING`) está en la lista
+    // ni casa con su regex dinámico — así que el código SIEMPRE resuelve el
+    // endpoint pooled (PgBouncer en modo transacción), nunca el directo. Bajo
+    // ese pooler, un lock de sesión y su unlock pueden caer en backends
+    // distintos: el unlock no lanza, devuelve `false` y loguea un WARNING que
+    // nadie ve, y el lock queda tomado hasta que el pooler recicle esa
+    // conexión — sin timeout, cuelga toda admisión futura con esa llave. No
+    // es un "depende del entorno": para llegar al endpoint directo haría
+    // falta inventar una variable con un nombre que casualmente termine en
+    // `_DATABASE_URL`.
+    //
+    // El lock transaccional no necesita compartir conexión con lo que
+    // protege — necesita estar tomado MIENTRAS ese trabajo corre. Por eso se
+    // abre una transacción en esta conexión dedicada, se toma el lock ahí, y
+    // `fn` sigue corriendo sobre el `pool` principal sin tocar nada de su
+    // código: la exclusión mutua es idéntica a la de antes, porque nunca
+    // dependió de la conexión sino del candado. Se libera SOLO al COMMIT o al
+    // ROLLBACK — nunca queda un `finally` que no corrió, y si el proceso
+    // muere a mitad, el pooler hace ROLLBACK de la transacción abierta al
+    // devolver el backend al pool, así que el lock se libera igual.
+    //
+    // La conexión dedicada sale de `lockPool`, NUNCA de `pool` — ver el
+    // comentario largo donde se crea `lockPool`, arriba: si saliera de la
+    // misma fuente que `fn` necesita para sus propias queries, alcanzaban
+    // tres admisiones concurrentes para agotar el pool entero y dejarlas a
+    // las tres esperando una conexión que ninguna puede soltar (hallazgo de
+    // QA).
+    //
+    // `hashtextextended(_, 0)` da un entero de 64 bits (existe desde PG 11),
+    // no los 32 de `hashtext()`: baja en la práctica a cero la probabilidad
+    // de que dos external_id distintos compartan la llave del lock. Tiene
+    // que usar la MISMA forma que `deletePerson` — son espacios de lock
+    // distintos, y media migración no serializa nada.
+    async withExternalIdLock(externalId, fn) {
+      const client = await lockPool.connect();
+      try {
+        await client.query('BEGIN');
+        // Convierte una espera patológica en un error en vez de un cuelgue
+        // sin límite. SET LOCAL es de alcance transaccional, así que sí
+        // funciona detrás de un pooler en modo transacción (SET a secas, no).
+        await client.query("SET LOCAL lock_timeout = '5s'");
+        await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [externalId]);
+        const out = await fn();
+        await client.query('COMMIT');
+        return out;
+      } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw e;
+      } finally {
+        client.release();
+      }
     },
     async counts() {
       const r = await one(`SELECT
@@ -566,10 +1007,46 @@ async function createPostgresAdapter(connectionString) {
         [personId, updateId ?? null, faceId, similarity ?? null, surface]
       );
     },
-    async insertContactLog({ personId, updateId, channel, result }) {
-      await pool.query(
-        'INSERT INTO contact_log (person_id, update_id, channel, result) VALUES ($1, $2, $3, $4)',
-        [personId, updateId ?? null, channel, result]
+    // `source`/`externalRef`/`createdAt` solo los usa el registrador externo
+    // (POST /api/contact-log): la app escribe sin ellos y cae al default
+    // 'app', que es lo que la deja adentro de su propia serie. Devuelve
+    // `{ inserted }` porque el reintento de un registro externo NO es un
+    // error — es el mismo hecho llegando dos veces, y quien reintenta
+    // necesita saber cuál de las dos cosas pasó.
+    async insertContactLog({ personId, updateId, channel, result, source = 'app', externalRef = null, createdAt = null }) {
+      const row = await one(
+        `INSERT INTO contact_log (person_id, update_id, channel, result, source, external_ref, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7::timestamptz, now()))
+         ON CONFLICT (external_ref) WHERE external_ref IS NOT NULL DO NOTHING
+         RETURNING id`,
+        [personId, updateId ?? null, channel, result, source, externalRef, createdAt]
+      );
+      return { inserted: !!row };
+    },
+    // Borra UNA fila externa por su referencia. `source = 'operador'` no es
+    // decorativo: es lo que garantiza que este camino jamás pueda borrar un
+    // envío que la app sí hizo. Devuelve false si no había nada que borrar
+    // — deshacer dos veces es tan idempotente como registrar dos veces.
+    async deleteContactLogByRef(externalRef) {
+      const row = await one(
+        "DELETE FROM contact_log WHERE external_ref = $1 AND source = 'operador' RETURNING id",
+        [externalRef]
+      );
+      return !!row;
+    },
+    // Los contactos que llegaron A UNA FAMILIA sobre esta persona, en orden.
+    // 'relevo' queda afuera EN EL SQL, no en la vista: un relevo es un aviso
+    // que la app retuvo y mandó al buzón del equipo, o sea exactamente lo
+    // contrario a "se avisó a quien reportó". Filtrarlo acá abajo hace
+    // imposible que una vista futura lo muestre como si fuera un aviso
+    // entregado.
+    async familyContactLogByPerson(personId) {
+      return all(
+        `SELECT channel, result, source, created_at
+         FROM contact_log
+         WHERE person_id = $1 AND channel <> 'relevo'
+         ORDER BY created_at ASC, id ASC`,
+        [personId]
       );
     },
     // #150: registro de cada auto-fusión por nombre — ver el comentario del
@@ -580,6 +1057,55 @@ async function createPostgresAdapter(connectionString) {
         [personId, submittedName, score]
       );
     },
+    // ===== COLA DE REVISIÓN DE ESTADO (#190) — inicio =====================
+    // Ver el comentario gemelo en src/store/sqlite.js: la cola son las
+    // personas cuyo ÚLTIMO estado es `unknown`, con el mismo filtro de
+    // "último estado" que missingPeople, y sin bandera de "resuelto" porque
+    // resolver escribe una fila nueva en `updates` y la ficha sale sola.
+    async unknownPeople(limit) {
+      return all(
+        `WITH latest AS (
+           SELECT u.*,
+                  ROW_NUMBER() OVER (PARTITION BY u.person_id ORDER BY u.created_at DESC, u.id DESC) AS rn
+           FROM updates u
+           ${AGGREGATOR_SAFE_EXCLUSION}
+         )
+         SELECT p.id, p.full_name,
+                l.id AS update_id, l.status, l.message, l.location, l.source,
+                l.source_url, l.created_at AS last_report
+         FROM people p
+         JOIN latest l ON l.person_id = p.id AND l.rn = 1
+         WHERE l.status = 'unknown'
+         ORDER BY l.created_at DESC
+         LIMIT $1`,
+        [limit]
+      );
+    },
+    async insertStatusReview({ personId, probableStatus, evidenceNote, author, resolved, updateId, recipients, notifyMode }) {
+      return one(
+        `INSERT INTO status_review
+           (person_id, probable_status, evidence_note, author, resolved, update_id, recipients, notify_mode)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         RETURNING *`,
+        [
+          personId,
+          probableStatus,
+          evidenceNote,
+          author,
+          Boolean(resolved),
+          updateId ?? null,
+          Number.isFinite(recipients) ? recipients : null,
+          notifyMode ?? null
+        ]
+      );
+    },
+    async statusReviewsForPerson(personId) {
+      return all(
+        'SELECT * FROM status_review WHERE person_id = $1 ORDER BY created_at DESC, id DESC',
+        [personId]
+      );
+    },
+    // ===== COLA DE REVISIÓN DE ESTADO (#190) — fin ========================
     // Cuenta total y por superficie. `since` (ISO) filtra a lo escrito desde
     // ahí — se usa para la línea de "cambio desde el reporte anterior" del
     // correo operativo; sin `since`, es el acumulado histórico completo.
@@ -597,9 +1123,15 @@ async function createPostgresAdapter(connectionString) {
     },
     // Una fila por (channel, result) — el correo pivotea esto en su propia
     // tabla. `since` con el mismo significado que en matchLogCounts.
-    async contactLogCounts({ since } = {}) {
-      const clause = since ? 'WHERE created_at >= $1' : '';
-      const params = since ? [since] : [];
+    //
+    // `source` por omisión 'app': un llamador que no diga nada sigue viendo
+    // EXACTAMENTE lo que veía antes de que existiera la columna. La
+    // alternativa (devolver todo y que cada llamador se acuerde de filtrar)
+    // hace que olvidarse contamine la serie en silencio, que es el modo de
+    // fallo que esta columna existe para evitar. `source: null` pide todo, y
+    // hay que escribirlo.
+    async contactLogCounts({ since, source = 'app' } = {}) {
+      const { clause, params } = contactLogWhere({ since, source });
       return all(
         `SELECT channel, result, COUNT(*)::int AS count FROM contact_log ${clause} GROUP BY channel, result ORDER BY channel, result`,
         params
@@ -625,9 +1157,8 @@ async function createPostgresAdapter(connectionString) {
         params
       );
     },
-    async contactLogDaily({ since } = {}) {
-      const clause = since ? 'WHERE created_at >= $1' : '';
-      const params = since ? [since] : [];
+    async contactLogDaily({ since, source = 'app' } = {}) {
+      const { clause, params } = contactLogWhere({ since, source });
       return all(
         `SELECT to_char(created_at AT TIME ZONE 'America/Bogota', 'YYYY-MM-DD') AS day, result, COUNT(*)::int AS count
          FROM contact_log ${clause} GROUP BY day, result ORDER BY day`,
@@ -651,8 +1182,18 @@ async function createPostgresAdapter(connectionString) {
       const r = await one("SELECT to_char(MIN(created_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS min FROM match_log", []);
       return r.min || null;
     },
-    async contactLogEarliest() {
-      const r = await one("SELECT to_char(MIN(created_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS min FROM contact_log", []);
+    // Mismo default 'app' que los agregados de arriba, y acá el motivo se ve
+    // solo: un contacto del operador registrado con fecha del 11-ago correría
+    // "envíos medidos desde" hacia atrás y pintaría como instrumentados días
+    // en los que la app no había medido nada. La frase "medido desde…" existe
+    // precisamente para no mentir por omisión; no puede ser el primer sitio
+    // donde se cuela una fila de otra procedencia.
+    async contactLogEarliest({ source = 'app' } = {}) {
+      const { clause, params } = contactLogWhere({ source });
+      const r = await one(
+        `SELECT to_char(MIN(created_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS min FROM contact_log ${clause}`,
+        params
+      );
       return r.min || null;
     },
 
@@ -798,6 +1339,7 @@ async function createPostgresAdapter(connectionString) {
 
     async close() {
       await pool.end();
+      await lockPool.end();
     }
   };
 }

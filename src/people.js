@@ -291,8 +291,29 @@ function createStore(adapter) {
   }
 
   // Deletes the person and, by cascade, their reports, subscriptions and photos.
-  async function deletePerson(id) {
-    return isoRow(await adapter.deletePerson(id));
+  //
+  // `options` viaja tal cual al adaptador. El único que existe hoy es
+  // `atSubjectRequest`, que marca el borrado del ARCO — el que además deja
+  // constancia de las llaves externas con las que la ficha podría volver a
+  // entrar (#191). Sin esa constancia el borrado se deshace con un re-envío.
+  async function deletePerson(id, options) {
+    return isoRow(await adapter.deletePerson(id, options));
+  }
+
+  // ¿Esta llave externa es de una ficha que se borró a solicitud de su titular?
+  // La consulta el ingreso ANTES de crear (src/report-admission.js), que es el
+  // único lugar donde alcanza a impedir que la ficha vuelva.
+  async function isExternalIdSuppressed(externalId) {
+    return adapter.isExternalIdSuppressed(externalId);
+  }
+
+  // Serializa, por external_id, el chequeo-y-escritura de una admisión contra
+  // la ventana en la que `deletePerson({ atSubjectRequest: true })` suprime esa
+  // misma llave (#192). Pass-through directo: cada adaptador implementa el
+  // lock con lo que tiene — advisory lock de sesión en Postgres, mutex en
+  // memoria en SQLite — pero el contrato es el mismo para quien lo llama.
+  async function withExternalIdLock(externalId, fn) {
+    return adapter.withExternalIdLock(externalId, fn);
   }
 
   // Bitácora de coincidencias y envíos (#116, PR 4). Pass-through directo:
@@ -307,6 +328,26 @@ function createStore(adapter) {
 
   async function insertMergeLog(fields) {
     return adapter.insertMergeLog(fields);
+  }
+
+  // ---- Cola de revisión de estado (#190) --------------------------------
+  // Pass-through, igual que la bitácora: la lógica de qué significa una ficha
+  // en la cola y de qué hace falta para resolverla vive en
+  // src/statusReview.js, no acá.
+  //
+  // El límite por omisión es alto a propósito: es una cola de trabajo que una
+  // persona tiene que vaciar, no un listado paginado, y una ficha que no se
+  // ve es una ficha que sigue publicada como buscada.
+  async function getUnknownPeople(limit = 200) {
+    return (await adapter.unknownPeople(limit)).map(isoRow);
+  }
+
+  async function insertStatusReview(fields) {
+    return isoRow(await adapter.insertStatusReview(fields));
+  }
+
+  async function statusReviewsForPerson(personId) {
+    return (await adapter.statusReviewsForPerson(personId)).map(isoRow);
   }
 
   async function matchLogCounts(opts) {
@@ -329,8 +370,21 @@ function createStore(adapter) {
     return adapter.matchLogEarliest();
   }
 
-  async function contactLogEarliest() {
-    return adapter.contactLogEarliest();
+  async function contactLogEarliest(opts) {
+    return adapter.contactLogEarliest(opts);
+  }
+
+  async function deleteContactLogByRef(externalRef) {
+    return adapter.deleteContactLogByRef(externalRef);
+  }
+
+  // Normaliza igual que getPerson/getUpdates: Postgres entrega `created_at`
+  // como Date y SQLite como string ISO, y el consumidor (el bloque de avisos
+  // de la ficha) se lo pasa a timeTag() sin distinguir. Sin isoRow, el
+  // atributo datetime del <time> sale con la forma del motor —o sea, distinto
+  // en producción que en la suite, que corre sobre SQLite.
+  async function familyContactLogByPerson(personId) {
+    return (await adapter.familyContactLogByPerson(personId)).map(isoRow);
   }
 
   // Cifras del panel #132 — pass-through directo, igual que el resto de la
@@ -387,15 +441,22 @@ function createStore(adapter) {
     counts,
     faceIdsForPerson,
     deletePerson,
+    isExternalIdSuppressed,
+    withExternalIdLock,
     insertMatchLog,
     insertContactLog,
     insertMergeLog,
+    getUnknownPeople,
+    insertStatusReview,
+    statusReviewsForPerson,
     matchLogCounts,
     contactLogCounts,
     matchLogDaily,
     contactLogDaily,
     matchLogEarliest,
     contactLogEarliest,
+    deleteContactLogByRef,
+    familyContactLogByPerson,
     updatesBeyondFirstBySource,
     queryPhotoPeople,
     matchLogSimilarityRows,

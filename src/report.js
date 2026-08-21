@@ -258,13 +258,34 @@ esto <strong>no significa que sean cero</strong>, significa que no se pudieron m
     ])
   );
 
+  // Contactos hechos POR FUERA de la app, en su propia tabla. Nunca dentro de
+  // la de arriba: el envío de la app y el correo que una persona del equipo
+  // mandó desde su buzón responden preguntas distintas, y sumarlos deja sin
+  // respuesta a las dos. Un lector que vea 88 relevos retenidos y 24 "enviados
+  // por correo" en la misma tabla se encuentra una contradicción sin
+  // explicación posible.
+  const outreachPivot = pivotContact(activity.outreach);
+  const outreachTotals = sumContact(outreachPivot);
+  const outreachSection = outreachTotals.total
+    ? `<p style="font-size:13px;color:#555;margin:16px 0 4px;"><strong>Aparte: contactos que hizo el equipo por fuera de la app</strong> (${n(outreachTotals.enviados)} entregados de ${n(outreachTotals.total)} registrados). Se registran por <code>POST /api/contact-log</code> desde la máquina de quien los mandó, con la fecha real del contacto. <strong>No entran en la tabla de arriba</strong> ni en ninguna de sus gráficas: la serie de arriba mide lo que hizo la app, y esto mide lo que hizo una persona.</p>` +
+      table(
+        ['Canal', 'Entregados', 'Fallidos'],
+        ['email', 'whatsapp'].map((ch) => [
+          CHANNEL_LABEL[ch],
+          n(outreachPivot[ch].enviado),
+          n(outreachPivot[ch].fallido)
+        ])
+      )
+    : '<p style="font-size:13px;color:#555;margin:16px 0 4px;">Aparte: no hay ningún contacto del equipo hecho por fuera de la app registrado todavía (<code>POST /api/contact-log</code>). Cero acá significa "no se ha registrado ninguno", no "no se contactó a nadie".</p>';
+
   const bitacoraSection =
     section('3 · Envíos y coincidencias registradas en el momento (acumulado, desde que existe la bitácora)') +
     instrumentedSinceNote(activity.instrumentedSince) +
     '<p style="font-size:13px;color:#555;margin:0 0 4px;">Coincidencias — cada vez que el matcher encuentra a alguien, en el momento en que pasa (ya no es el recálculo del embudo de arriba):</p>' +
     matchTable +
-    `<p style="font-size:13px;color:#555;margin:12px 0 4px;">Envíos intentados, por canal — <strong>los fallos y rechazos importan más que los enviados</strong>: un canal que solo cuenta lo que salió bien siempre se ve sano. "${esc(CHANNEL_LABEL.relevo)}" es todo lo que fue al buzón del <strong>equipo</strong>, nunca a una familia ni a un rescatista: coincidencias pendientes de revisión (modo relevo), solicitudes de publicar en Colombia Te Busca, y avisos de rescatista.</p>` +
-    contactTable;
+    `<p style="font-size:13px;color:#555;margin:12px 0 4px;">Envíos intentados <strong>por la app</strong>, por canal — <strong>los fallos y rechazos importan más que los enviados</strong>: un canal que solo cuenta lo que salió bien siempre se ve sano. "${esc(CHANNEL_LABEL.relevo)}" es todo lo que fue al buzón del <strong>equipo</strong>, nunca a una familia ni a un rescatista: coincidencias pendientes de revisión (modo relevo), solicitudes de publicar en Colombia Te Busca, y avisos de rescatista.</p>` +
+    contactTable +
+    outreachSection;
 
   const notYet =
     section('4 · Lo que todavía NO podemos medir') +
@@ -280,8 +301,8 @@ esto <strong>no significa que sean cero</strong>, significa que no se pudieron m
           'Son diálogo (confirmaciones, ayuda), no avisos sobre una coincidencia o una actualización — categoría distinta a la que cubre contact_log hoy.'
         ],
         [
-          'Envíos manuales del operador (por fuera de la app)',
-          'Los avisos que el equipo manda a mano desde su propio correo/WhatsApp — por ejemplo, 48 personas contactadas así en dos días — no pasan por ningún endpoint de encontrados.co, así que no hay dónde registrarlos hoy. Necesitarían un endpoint propio; fuera de alcance de esta pasada.'
+          'Envíos manuales del operador que nadie registró',
+          'Ya hay dónde registrarlos: <code>POST /api/contact-log</code>, y salen en su propia tabla arriba. Lo que sigue afuera es lo que <strong>no se registre</strong> — la app no puede enterarse sola de un correo que salió de otro buzón, así que este número solo es tan completo como lo que el equipo alcance a registrar.'
         ]
       ]
     );
@@ -372,12 +393,14 @@ function buildReportText(generatedAt, counts, stats, matcherStatus, activity, fu
   const matchPivot = activity.match || { total: 0, rescate: 0, report: 0, api: 0 };
   const contactPivot = pivotContact(activity.contact);
   const contactTotals = sumContact(contactPivot);
+  const outreachTotals = sumContact(pivotContact(activity.outreach));
   const fmtSince = (d) => (d ? `${bogotaClock(d).day} ${bogotaClock(d).month}, ${bogotaClock(d).hm} Bogotá` : 'sin registros todavía');
   lines.push(
     'Bitácora (acumulado, en el momento en que ocurre):',
     `  Medido desde: coincidencias desde ${fmtSince(activity.instrumentedSince && activity.instrumentedSince.match)} · envíos desde ${fmtSince(activity.instrumentedSince && activity.instrumentedSince.contact)}`,
     `  Coincidencias registradas: ${n(matchPivot.total)} (rescate ${n(matchPivot.rescate)}, reporte ${n(matchPivot.report)}, API ${n(matchPivot.api)})`,
-    `  Envíos intentados: ${n(contactTotals.total)} (${n(contactTotals.enviados)} entregados)`,
+    `  Envíos intentados por la app: ${n(contactTotals.total)} (${n(contactTotals.enviados)} entregados)`,
+    `  Aparte, contactos del equipo por fuera de la app: ${n(outreachTotals.total)} (${n(outreachTotals.enviados)} entregados) — no se suman a la línea de arriba`,
     ''
   );
 
@@ -430,17 +453,25 @@ async function gatherCheapReportData(store, matcher, { at = new Date() } = {}) {
   // Rekognition esté apagado ahora mismo, porque son hechos ya ocurridos.
   const sinceAt = previousScheduledBogota(generatedAt);
   const sinceIso = sinceAt.toISOString();
-  const [matchAll, contactAll, matchSince, contactSince, matchEarliest, contactEarliest] = await Promise.all([
-    store.matchLogCounts(),
-    store.contactLogCounts(),
-    store.matchLogCounts({ since: sinceIso }),
-    store.contactLogCounts({ since: sinceIso }),
-    store.matchLogEarliest(),
-    store.contactLogEarliest()
-  ]);
+  const [matchAll, contactAll, matchSince, contactSince, matchEarliest, contactEarliest, outreachAll] =
+    await Promise.all([
+      store.matchLogCounts(),
+      // Sin `source`, estas tres piden la serie de la APP — el default del
+      // adapter. Es deliberado: lo que miden ("¿el relevo está reteniendo?",
+      // "¿la app entregó?") solo tiene sentido sobre lo que la app hizo.
+      store.contactLogCounts(),
+      store.matchLogCounts({ since: sinceIso }),
+      store.contactLogCounts({ since: sinceIso }),
+      store.matchLogEarliest(),
+      store.contactLogEarliest(),
+      // Y esta, aparte y explícita, los contactos que el equipo hizo por
+      // fuera de la app. Nunca se suman a los de arriba: son otro hecho.
+      store.contactLogCounts({ source: 'operador' })
+    ]);
   const activity = {
     match: matchAll,
     contact: contactAll,
+    outreach: outreachAll,
     since: { at: sinceAt, match: matchSince, contact: contactSince },
     // Hotfix post-#127/#128: "acumulado" no es lo mismo que "toda la
     // historia" — la bitácora tiene una fecha de nacimiento (#125). Sin esto,

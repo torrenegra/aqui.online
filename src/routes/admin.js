@@ -15,6 +15,16 @@ const {
 } = require('../adminAuth');
 const { gatherCheapReportData, gatherFunnelStats, gatherDailySeries, gatherPanelExtras } = require('../report');
 const { buildStatsPageHtml, buildFunnelFragmentHtml } = require('../adminStats');
+const { normalizeSourceUrl } = require('../report-admission');
+const {
+  gatherQueue,
+  gatherFicha,
+  recordNote,
+  resolveFicha,
+  buildQueuePageHtml,
+  buildFichaPageHtml,
+  buildResolvedPageHtml
+} = require('../statusReview');
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -102,6 +112,7 @@ function adminRoutes(store, matcher) {
       <h1>Panel de administración</h1>
       <p>Sesión: <strong>${esc(req.adminEmail)}</strong></p>
       <p>📊 <a href="/admin/stats">Estadísticas</a> — coincidencias, envíos y la base en general.</p>
+      <p>🔎 <a href="/admin/revision">Cola de revisión de estado</a> — fichas SIN CONFIRMAR que siguen publicadas como buscadas.</p>
       <p>El drill-down por ID (nombres y contactos en vivo) todavía no existe.</p>
       <form method="post" action="/admin/logout"><button type="submit">Cerrar sesión</button></form>
     `;
@@ -165,6 +176,128 @@ function adminRoutes(store, matcher) {
       }
     })
   );
+
+  // ===== COLA DE REVISIÓN DE ESTADO (#190) — inicio ========================
+  //
+  // Una ficha en `unknown` no tiene salida y se queda publicada como buscada
+  // (ver el comentario largo en src/statusReview.js). Estas cuatro rutas son
+  // la cola y la salida humana: la evidencia a la vista, una ficha a la vez, y
+  // constancia de quién decidió, cuándo y con qué.
+  //
+  // Todas exigen sesión de /admin — nunca statsGate, que tiene una ventana
+  // pública temporal. Acá se muestran datos sin agregar de personas concretas,
+  // y se escribe.
+  const wantsBody = express.urlencoded({ extended: false });
+
+  const noIndex = (res) => res.set('X-Robots-Tag', 'noindex, nofollow');
+
+  // `:id` llega crudo de la URL. En SQLite un id no numérico simplemente no
+  // encuentra nada, pero en Postgres —que es producción— comparar texto contra
+  // una columna INTEGER revienta con 22P02 y sale un 500. Una ruta de /admin
+  // que devuelve 500 ante una URL mal escrita manda a depurar la base cuando
+  // el problema era la URL. Se valida acá, antes de cualquier lectura, y se
+  // responde 404: no existe esa persona, que es la verdad.
+  //
+  // Hallazgo de coderabbitai en la revisión de este PR.
+  function personIdOrNull(raw) {
+    if (!/^\d+$/.test(String(raw ?? ''))) return null;
+    const id = Number(raw);
+    return Number.isSafeInteger(id) && id > 0 ? id : null;
+  }
+
+  const noSuchPerson = (res) =>
+    res.status(404).send(layout('No encontrado', '<p class="error">Persona no encontrada.</p>'));
+
+  router.get(
+    '/revision',
+    requireAdminSession,
+    wrap(async (req, res) => {
+      noIndex(res);
+      res.send(buildQueuePageHtml(await gatherQueue(store)));
+    })
+  );
+
+  router.get(
+    '/revision/:id',
+    requireAdminSession,
+    wrap(async (req, res) => {
+      noIndex(res);
+      const personId = personIdOrNull(req.params.id);
+      if (personId === null) return noSuchPerson(res);
+      const ficha = await gatherFicha(store, personId);
+      if (!ficha) return noSuchPerson(res);
+      res.send(buildFichaPageHtml(ficha));
+    })
+  );
+
+  // Re-render de la misma pantalla con los errores arriba y lo que la persona
+  // ya había escrito todavía en el formulario. Perder un párrafo de evidencia
+  // por un campo faltante es la clase de fricción que hace que la próxima vez
+  // no se escriba nada.
+  // `formName` NO es decorativo: las dos formas comparten los nombres de campo
+  // (`estado`, `evidencia`), así que sin decir de cuál vino el envío, el texto
+  // que alguien escribió para una constancia sin efecto reaparecía precargado
+  // dentro del formulario de RESOLVER —el que manda avisos— y el de constancia
+  // volvía vacío. Hallazgo de coderabbitai en la revisión de este PR.
+  async function reRenderWithErrors(req, res, errors, formName) {
+    const personId = personIdOrNull(req.params.id);
+    if (personId === null) return noSuchPerson(res);
+    const ficha = await gatherFicha(store, personId);
+    if (!ficha) return noSuchPerson(res);
+    noIndex(res);
+    res.status(400).send(buildFichaPageHtml(ficha, { errors, form: req.body || {}, formName }));
+  }
+
+  // Constancia sin efecto: el marcador privado de "probable" más lo que la
+  // persona encontró. No cambia el estado público y no manda ningún aviso.
+  router.post(
+    '/revision/:id/nota',
+    requireAdminSession,
+    wantsBody,
+    wrap(async (req, res) => {
+      const personId = personIdOrNull(req.params.id);
+      if (personId === null) return noSuchPerson(res);
+      const { estado, evidencia } = req.body || {};
+      const result = await recordNote({
+        store,
+        personId,
+        author: req.adminEmail,
+        estado,
+        evidencia
+      });
+      if (!result.ok) return reRenderWithErrors(req, res, result.errors, 'nota');
+      res.redirect(`/admin/revision/${personId}`);
+    })
+  );
+
+  // La salida. Escribe el estado nuevo Y MANDA AVISOS — ver la advertencia que
+  // la pantalla muestra antes de habilitar este botón.
+  router.post(
+    '/revision/:id/resolver',
+    requireAdminSession,
+    wantsBody,
+    wrap(async (req, res) => {
+      const personId = personIdOrNull(req.params.id);
+      if (personId === null) return noSuchPerson(res);
+      const { estado, evidencia, enlace, confirmo } = req.body || {};
+      const result = await resolveFicha({
+        store,
+        personId,
+        author: req.adminEmail,
+        estado,
+        evidencia,
+        enlace,
+        // Crudo a propósito: la regla de qué cuenta como confirmación vive en
+        // src/statusReview.js, al lado de la casilla que emite el valor.
+        confirmo,
+        normalizeSourceUrl
+      });
+      if (!result.ok) return reRenderWithErrors(req, res, result.errors, 'resolver');
+      noIndex(res);
+      res.send(buildResolvedPageHtml(result));
+    })
+  );
+  // ===== COLA DE REVISIÓN DE ESTADO (#190) — fin ===========================
 
   return router;
 }
