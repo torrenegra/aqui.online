@@ -21,6 +21,8 @@
 //          names are close enough to deserve a human's eyes but not close
 //          enough to merge unasked.
 
+const { matcherReady } = require('./faces');
+
 // Deliberately below findOrCreatePerson's 0.85 auto-merge and above the 0.55
 // used for open search: this is the "worth asking about" band, not a new
 // merging rule. The calibrated 0.85/0.55 thresholds are untouched.
@@ -50,18 +52,15 @@ async function findDuplicateCandidates(
     // leads with a group shot where no face is usable, and the portrait that
     // would have matched an existing report sits at #2.
     const usable = (photoBuffers || []).filter((b) => b && b.length);
-    // Wake the lazy matcher before reading `enabled`. In the current
-    // report-admission.js flow this runs LAST, after processPhoto already
-    // indexed (and woke) the matcher for the same photos — so this is
-    // usually a no-op by the time it gets here. It stays because this
-    // function is also called directly (tests, and any future caller that
-    // checks for duplicates without indexing first), and it must not assume
-    // someone else already woke the matcher. Inside the try on purpose — a
-    // failed wake-up degrades to "no candidates", never a broken report.
-    if (matcher && usable.length && typeof matcher.ensureReady === 'function') {
-      await matcher.ensureReady();
-    }
-    if (matcher && matcher.enabled && usable.length) {
+    // En el flujo actual de report-admission.js esto corre LAST, después de
+    // que processPhoto ya indexó (y despertó) el matcher para las mismas
+    // fotos — así que `matcherReady` suele ser un no-op para cuando llega
+    // acá. Se llama igual porque esta función también se invoca directo
+    // (pruebas, y cualquier llamador futuro que busque duplicados sin indexar
+    // antes), y no puede asumir que alguien más ya despertó el matcher.
+    // Adentro del try a propósito — un despertar fallido degrada a "sin
+    // candidatos", nunca en un reporte roto.
+    if (matcher && usable.length && (await matcherReady(matcher))) {
       for (const bytes of usable) {
         try {
           const hits = await matcher.searchByImage(bytes);

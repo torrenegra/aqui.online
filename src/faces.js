@@ -292,4 +292,24 @@ function createLazyMatcher() {
   };
 }
 
-module.exports = { createMatcher, createLazyMatcher, nullMatcher };
+// La pregunta que todo llamador termina haciendo, de una u otra forma: "¿puedo
+// hacer trabajo de reconocimiento facial ahora mismo?" (#89). El getter
+// `enabled` de arriba es una trampa cuando el matcher es el lazy wrapper: es
+// un valor cacheado sobre un objeto que puede no existir todavía, y leerlo
+// antes de `ensureReady()` da `false` con Rekognition perfectamente
+// disponible. Cada llamador reescribía el mismo par de líneas — despertar el
+// matcher si sabe cómo, después leer `enabled` — con un guard `typeof`
+// defensivo porque `nullMatcher` y los dobles de test no siempre implementan
+// `ensureReady`. Este es ese par de líneas, escrito una sola vez.
+//
+// Sirve para las tres formas de matcher que este código recibe: el lazy
+// wrapper de producción (necesita `ensureReady()` antes de que su respuesta
+// signifique algo), el matcher real o `nullMatcher` (ya resueltos, responden
+// al toque) y los dobles de test (no tienen inicialización perezosa que
+// esperar, así que `ensureReady` sencillamente no existe en ellos).
+async function matcherReady(matcher) {
+  if (typeof matcher.ensureReady === 'function') await matcher.ensureReady();
+  return !!matcher.enabled;
+}
+
+module.exports = { createMatcher, createLazyMatcher, nullMatcher, matcherReady };

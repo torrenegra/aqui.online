@@ -23,6 +23,7 @@ const { storeThumbnail } = require('./thumbs');
 const { toMatchable } = require('./photo');
 const { hasGeometry, derivativeAction } = require('./report-photo');
 const { logMatch, logContact, resultFromSend } = require('./logbook');
+const { matcherReady } = require('./faces');
 
 const MAX_QUERY_PHOTOS = 3;
 
@@ -558,14 +559,7 @@ async function processPhoto(store, matcher, { personId, kind, updateId, subscrip
   }
   const content = usable.bytes;
 
-  // Wake the lazy matcher BEFORE reading `enabled`: it is a getter over the
-  // real matcher, which does not exist until something initializes it. On a
-  // cold serverless invocation the flag reads false even though Rekognition is
-  // perfectly available, and the photo below is stored without indexing — no
-  // face geometry for the public overlay, no match for whoever is searching.
-  if (typeof matcher.ensureReady === 'function') await matcher.ensureReady();
-
-  if (!matcher.enabled) {
+  if (!(await matcherReady(matcher))) {
     console.warn(
       `[facematch] matcher disabled — photo ${photo.id} stored WITHOUT indexing (will be picked up by /api/reindex)`
     );
@@ -586,8 +580,7 @@ async function processPhoto(store, matcher, { personId, kind, updateId, subscrip
 // Index photos that were stored while face matching was unavailable, and run
 // matching for them so missed coincidences still reach the people waiting.
 async function backfillUnindexedPhotos(store, matcher, limit = 100) {
-  if (typeof matcher.ensureReady === 'function') await matcher.ensureReady();
-  if (!matcher.enabled) {
+  if (!(await matcherReady(matcher))) {
     return { ok: false, error: 'El reconocimiento facial no está activo.', processed: 0 };
   }
   const pending = await store.photosMissingFaceId(limit);
@@ -619,7 +612,20 @@ async function backfillUnindexedPhotos(store, matcher, limit = 100) {
 // Thumbnails don't need Rekognition at all, so they are still generated (as a
 // centred crop) when face matching is unavailable.
 async function backfillPhotoDerivatives(store, matcher, limit = 100) {
-  if (typeof matcher.ensureReady === 'function') await matcher.ensureReady();
+  // Una sola lectura para toda la corrida: el mismo valor que `derivativeAction`
+  // y el loop de abajo usan varias veces, en vez de que cada uso vuelva a leer
+  // el getter perezoso (#89).
+  //
+  // Ventana angosta que esto introduce, señalada en revisión: si el matcher
+  // pasa de apagado a encendido A MITAD de esta corrida —otra request en la
+  // misma instancia lo despierta con su propio ensureReady()— la versión
+  // anterior (que releía `matcher.enabled` en cada vuelta) lo notaba y
+  // arrancaba a indexar lo que quedaba en ESTA corrida; con `ready` cacheado
+  // acá, esas fotos quedan pendientes hasta la SIGUIENTE corrida del barrido.
+  // No se pierde nada —siguen en `photosMissingDerivatives`—, solo se demora.
+  // Cachear sigue siendo lo correcto (evita leer el getter suelto varias
+  // veces por vuelta); el matiz es que ya no es cero diferencia observable.
+  const ready = await matcherReady(matcher);
   const pending = await store.photosMissingDerivatives(limit);
   let thumbs = 0;
   let geometries = 0;
@@ -631,21 +637,21 @@ async function backfillPhotoDerivatives(store, matcher, limit = 100) {
     // Already thumbnailed, and only Rekognition could add what's missing.
     // Redoing the centred crop would change nothing, so leave it for later —
     // otherwise this photo looks "pending" forever while matching is down.
-    if (derivativeAction(photo, matcher.enabled) === 'skip') {
+    if (derivativeAction(photo, ready) === 'skip') {
       waiting++;
       continue;
     }
     try {
       const bytes = Buffer.isBuffer(photo.content) ? photo.content : Buffer.from(photo.content);
       let geometry = hasGeometry(photo) ? photo.face_detail : null;
-      if (!geometry && matcher.enabled) {
+      if (!geometry && ready) {
         geometry = await matcher.detectFace(bytes);
         if (geometry) geometries++;
       }
       const thumb = await storeThumbnail(store, photo.id, bytes, geometry);
       if (thumb) {
         thumbs++;
-        if (!geometry && matcher.enabled) {
+        if (!geometry && ready) {
           // Rekognition looked and found no face. Without a mark, this photo
           // re-enters photosMissingDerivatives on EVERY run and gets a
           // DetectFaces call each time, forever — the pending counter never
@@ -677,7 +683,7 @@ async function backfillPhotoDerivatives(store, matcher, limit = 100) {
     no_face: noFace,
     waiting,
     failed,
-    face_matching: matcher.enabled
+    face_matching: ready
   };
 }
 
@@ -699,12 +705,7 @@ async function identifyRescuedPerson(
   matcher,
   { bytes, contentType, personId, subscriptionId, searchOnly = false }
 ) {
-  // Same cold-start trap as processPhoto: `enabled` is a getter over the
-  // lazily-built real matcher and reads false on a fresh serverless invocation
-  // — which would tell the very first rescuer to reach this instance that the
-  // service is down while Rekognition sits there available.
-  if (typeof matcher.ensureReady === 'function') await matcher.ensureReady();
-  if (!matcher.enabled) {
+  if (!(await matcherReady(matcher))) {
     return { available: false, matches: [] };
   }
 
@@ -819,8 +820,7 @@ async function identifyRescuedPerson(
 const MATCH_STATS_CONCURRENCY = 3;
 
 async function computeMatchStats(store, matcher) {
-  if (matcher.ensureReady) await matcher.ensureReady();
-  if (!matcher.enabled) return null;
+  if (!(await matcherReady(matcher))) return null;
 
   const rows = await store.indexedPhotos();
   const byFaceId = new Map(rows.map((r) => [r.face_id, r]));
@@ -934,12 +934,7 @@ async function computeMatchStats(store, matcher) {
 // `label` es solo para ese log: quien llama identifica lo que se borró
 // ("persona 91", "suscripción 44") sin que acá haya que saber de qué se trata.
 async function forgetPersonFaces(matcher, faceIds, label) {
-  // Se despierta el matcher primero y en los DOS caminos. El corto también
-  // reporta `face_matching`, y leerlo sin haber inicializado devolvía `false`
-  // con Rekognition perfectamente disponible: cosmético acá, pero es la misma
-  // clase de bug que el #89 y no vale dejarlo sembrado.
-  if (typeof matcher.ensureReady === 'function') await matcher.ensureReady();
-  const faceMatching = !!matcher.enabled;
+  const faceMatching = await matcherReady(matcher);
 
   const ids = (faceIds || []).filter(Boolean);
   if (!ids.length) {

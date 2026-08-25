@@ -20,6 +20,7 @@ const { publicUpdate } = require('../privacy');
 const gh = require('../github');
 const { sendReport } = require('../report');
 const { createReportAdmission } = require('../report-admission');
+const { matcherReady } = require('../faces');
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -505,9 +506,7 @@ function apiRoutes(store, matcher, petStore, petMatcher) {
   router.get(
     '/diag',
     wrap(async (req, res) => {
-      if (typeof matcher.ensureReady === 'function') {
-        await matcher.ensureReady();
-      }
+      const matcherAvailable = await matcherReady(matcher);
       // Read the key live: config captured at module load can be stale.
       const liveKey = (process.env.SENDGRID_API_KEY || env.SENDGRID_API_KEY || '').trim();
       const out = {
@@ -554,7 +553,7 @@ function apiRoutes(store, matcher, petStore, petMatcher) {
         faces: {
           aws_key_present: !!process.env.AWS_ACCESS_KEY_ID,
           aws_region: process.env.AWS_REGION || '(sin definir → us-east-1)',
-          matcher_enabled: !!matcher.enabled,
+          matcher_enabled: matcherAvailable,
           status: matcher.status || 'desconocido'
         },
         pet_matching: {
