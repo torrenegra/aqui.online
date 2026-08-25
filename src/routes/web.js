@@ -18,6 +18,7 @@ const { RESCUE_ANCHOR_PREFIX } = require('../people');
 const { readSession } = require('../adminAuth');
 const { createReportAdmission } = require('../report-admission');
 const { RESCUE_PRIVACY, searchOnlyCheckbox, matchContactBlock } = require('../rescue-contact');
+const { DEPARTAMENTOS } = require('../departments');
 
 // Express 4 doesn't catch async errors on its own.
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
@@ -989,6 +990,15 @@ ${RESCUE_FOOTER}`
       <input name="location" id="location" list="location-options" autocomplete="off" placeholder="Ej. Barrio San José, Armenia" required>
       <datalist id="location-options"></datalist>
     </span></label>
+  <label class="field-label"><span>Departamento donde vivía *</span>
+    <select name="department" required>
+      <option value="" disabled selected>Elige un departamento</option>
+      ${DEPARTAMENTOS.map((d) => `<option value="${esc(d)}">${esc(d)}</option>`).join('')}
+      <option value="no-lo-se">No lo sé</option>
+    </select></label>
+  <label class="field-label"><span>Edad aproximada (opcional)</span>
+    <input name="age" type="number" inputmode="numeric" min="0" max="120" placeholder="Ej. 34"></label>
+  <p class="subtle">Sirven para no confundirla con otra persona de nombre parecido. Si no estás seguro, marca «No lo sé» o deja la edad en blanco: un dato en blanco ayuda más que uno inventado.</p>
   <label class="field-label"><span>Tu teléfono para que te contacten</span>
     <input name="contact_phone" inputmode="tel" autocomplete="tel" maxlength="120" value="${esc(remembered.phone)}" placeholder="Ej. 300 123 4567"></label>
   <label class="field-label"><span>Tu correo</span>
@@ -1031,6 +1041,7 @@ ${LOCATION_SCRIPT}`,
       // casillas: con cualquiera de las dos el reporte pasa, igual que antes.
       const contact = composeContact({ phone, email, contact: req.body.contact });
       const files = (req.files || []).slice(0, MAX_QUERY_PHOTOS);
+      const desdeFicha = String(req.body.desde_ficha || '').trim();
       if (!name || !name.trim() || !location || !location.trim() || !contact || !files.length) {
         return res
           .status(400)
@@ -1054,6 +1065,11 @@ ${LOCATION_SCRIPT}`,
       // —era una casilla del relevo a un registro de terceros, que se retiró—.
       // La columna sigue viva y la siguen llenando el API y los agregadores,
       // así que las fichas que ya lo traen se siguen viendo igual.
+      //
+      // El `required` del <select> de departamento es un empujón del navegador,
+      // no una regla: acá NO se valida, porque botarle el reporte a una familia
+      // por un dato que apenas desempata nombres parecidos sería peor que el
+      // empate.
       const result = await admission.admitReport({
         name,
         status: 'missing',
@@ -1061,6 +1077,14 @@ ${LOCATION_SCRIPT}`,
         location,
         source: 'web',
         contact,
+        department: req.body.department,
+        age: req.body.age,
+        // «Yo la estoy buscando» sale de la ficha de alguien, con su nombre ya
+        // puesto: quien llegó por ahí ya afirmó de quién es este reporte. El
+        // veto de #150 adivina identidad y esto la declara, así que contra esa
+        // ficha no veta — si no, el botón le abriría un registro aparte a quien
+        // acaba de decir que es la misma persona.
+        assertedPersonId: desdeFicha || null,
         photos: files.map((f) => ({ bytes: f.buffer, contentType: f.mimetype })),
         skipAddresses: [phone, email.toLowerCase()].filter(Boolean),
         checkDuplicates: true,
@@ -1104,7 +1128,6 @@ ${LOCATION_SCRIPT}`,
       // — la alarma de nombre duplicado sería falsa el 100% de las veces. Solo
       // se apaga esa: los `candidates` por ROSTRO son información nueva y real
       // (un reporte con otro nombre y la misma cara), y siguen saliendo.
-      const desdeFicha = String(req.body.desde_ficha || '').trim();
       const sameNameIsExpected = !created && desdeFicha && desdeFicha === String(person.id);
       const sameName = !created && !sameNameIsExpected;
       if (candidates.length || sameName) {

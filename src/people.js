@@ -3,6 +3,14 @@
 const crypto = require('crypto');
 const { normalize, phoneticKey, titleCaseName, matchScore } = require('./names');
 const { logMerge } = require('./logbook');
+const { canonicalDepartment } = require('./departments');
+const { mergeBlockReason } = require('./merge-guard');
+
+// Cuántos candidatos por encima del umbral se examinan antes de rendirse y
+// abrir un registro nuevo. Cada uno cuesta una lectura de sus updates, y pasar
+// de un puñado solo ocurre con nombres muy comunes, donde el veto es justamente
+// lo que hay que aplicar a cada uno.
+const MERGE_CANDIDATES = 5;
 
 const STATUSES = ['safe', 'injured', 'missing', 'deceased', 'unknown'];
 // 'aggregator': updates pushed by an external data aggregator, distinct from
@@ -22,6 +30,26 @@ const RESCUE_ANCHOR_PREFIX = 'Persona rescatada ';
 // sin tildes) — derivada con la misma normalize() que usa el resto del
 // esquema, no una copia a mano de la regla.
 const RESCUE_ANCHOR_NORMALIZED_PREFIX = `${normalize(RESCUE_ANCHOR_PREFIX)} `;
+
+// La edad declarada, o null si no llegó o no es creíble.
+//
+// El rango (0..120) no está para validarle nada a nadie: está para que un dedazo
+// —«2024» en la casilla de edad, un año en vez de una edad— no se guarde como
+// una señal que después separe a dos reportes de la misma persona. Fuera de
+// rango se trata como "no declarado", que es lo que en realidad es.
+//
+// Se redondea porque la comparación de #150 es por margen de años: media edad
+// no significa nada y complicaría el tipo de la columna en los dos motores.
+// Solo número o texto: `Number(true)` es 1 y `Number([7])` es 7, así que un
+// JSON con `"age": true` entraría como una edad declarada de un año.
+function parseAge(value) {
+  if (typeof value !== 'number' && typeof value !== 'string') return null;
+  if (String(value).trim() === '') return null;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  const age = Math.round(n);
+  return age >= 0 && age <= 120 ? age : null;
+}
 
 // Postgres returns Date objects; SQLite returns strings. Present ISO strings everywhere.
 function isoRow(row) {
@@ -48,26 +76,51 @@ function createStore(adapter) {
       .slice(0, limit);
   }
 
-  // Reuse an existing person when the name confidently matches; otherwise create.
-  async function findOrCreatePerson(fullName) {
+  // Reusar una persona existente cuando el nombre o las señales permiten hacer un match.
+  // Ojo: con `externalId`, addUpdate puede devolver el reporte a la persona de
+  // la que este veto lo separó — ver el paso 4 de report-admission.
+  async function findOrCreatePerson(fullName, signals = {}) {
     const norm = normalize(fullName);
     if (!norm) throw new Error('Name is required');
     const exact = await adapter.exactByNormalized(norm);
     if (exact) return { person: isoRow(exact), created: false };
-    const [best] = await searchPeople(fullName, { limit: 1, minScore: 0.85 });
-    if (best) {
-      // #150: solo la fusión difusa (por score) se registra — un match exacto
-      // sobre el mismo normalized_name no es una decisión discutible.
-      await logMerge(adapter, { personId: best.id, submittedName: fullName, score: best.score });
-      return { person: await getPerson(best.id), created: false };
+
+    // Se recorren TODOS los candidatos por encima del umbral
+    const incoming = {
+      department: canonicalDepartment(signals.department),
+      age: parseAge(signals.age)
+    };
+    const asserted = signals.assertedPersonId;
+    let blocked = null;
+    for (const candidate of await searchPeople(fullName, { limit: MERGE_CANDIDATES, minScore: 0.85 })) {
+      const exempt = asserted != null && String(candidate.id) === String(asserted);
+      const reason = exempt ? null : mergeBlockReason(incoming, await getUpdates(candidate.id));
+      if (!reason) {
+        // Solo la fusión difusa (por score) se registra — un match exacto sobre
+        // el mismo normalized_name no es una decisión discutible. Y se registra
+        // la que OCURRE: una fusión vetada no es una fusión.
+        await logMerge(adapter, { personId: candidate.id, submittedName: fullName, score: candidate.score });
+        return { person: await getPerson(candidate.id), created: false };
+      }
+      if (!blocked) blocked = { reason, personId: candidate.id, score: candidate.score };
     }
+
     // Only new people are re-cased: an existing row keeps whatever it has, so
     // a correction made by hand isn't undone by the next report.
     const person = await adapter.insertPerson(titleCaseName(fullName), norm, phoneticKey(fullName));
-    return { person: isoRow(person), created: true };
+    return { person: isoRow(person), created: true, blocked };
   }
 
-  async function addUpdate(personId, { status, message, location, lat, lng, source, sourceUrl, reporter, contact, externalId }) {
+  // `department` y `age` son las señales con las que se separa a dos personas
+  // que comparten un nombre parecido.
+  //
+  // La normalización vive acá y no en cada handler por la misma razón que
+  // `normalizeSourceUrl` vive en report-admission: una regla repetida en tres
+  // puertas es una regla que se afloja en dos de ellas sin que nadie lo note.
+  async function addUpdate(
+    personId,
+    { status, message, location, lat, lng, source, sourceUrl, reporter, contact, externalId, department, age }
+  ) {
     if (!STATUSES.includes(status)) throw new Error(`Invalid status: ${status}`);
     return isoRow(
       await adapter.insertUpdate(personId, {
@@ -80,7 +133,9 @@ function createStore(adapter) {
         sourceUrl,
         reporter,
         contact,
-        externalId
+        externalId,
+        department: canonicalDepartment(department),
+        age: parseAge(age)
       })
     );
   }

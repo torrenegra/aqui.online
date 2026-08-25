@@ -174,6 +174,61 @@ test('findOrCreatePerson: ni un match exacto ni una persona nueva dejan fila en 
   }
 });
 
+// La bitácora registra la fusión que OCURRE. Cuando el veto de #150 separa a
+// dos reportes, no hubo fusión que registrar — y escribirla igual diría que dos
+// personas distintas son la misma, que es justo lo contrario de lo que pasó.
+//
+// Esta prueba existe porque las dos piezas llegaron por caminos separados: la
+// bitácora reescribió la rama que el veto convierte en bucle. Si un rebase
+// futuro se lleva la llamada a logMerge, nada falla y nada se registra — la
+// segunda mitad de la prueba es la que lo delata.
+test('findOrCreatePerson: una fusión vetada no se registra; la que sí ocurre, sí', async () => {
+  const dbPath = tempDbPath();
+  const store = createStore(await createSqliteAdapter(dbPath));
+  try {
+    const { person: original } = await store.findOrCreatePerson('John Alex Gomez');
+    await store.addUpdate(original.id, {
+      status: 'missing',
+      location: 'Un lugar de prueba',
+      source: 'web',
+      department: 'Quindío'
+    });
+
+    // Mismo par del issue #150 (0.855), pero el departamento se contradice.
+    const vetado = await store.findOrCreatePerson('Johan Gómez', { department: 'Antioquia' });
+    assert.equal(vetado.created, true, 'el veto debía abrirle su propio registro');
+    assert.equal(vetado.blocked.reason, 'department');
+
+    const raw = new Database(dbPath, { readonly: true });
+    try {
+      assert.equal(
+        raw.prepare('SELECT COUNT(*) AS n FROM merge_log').get().n,
+        0,
+        'una fusión que no ocurrió no puede quedar registrada'
+      );
+    } finally {
+      raw.close();
+    }
+
+    // Y sin señal que contradiga, la fusión ocurre y sí queda registrada.
+    const fusionado = await store.findOrCreatePerson('Jhon Alex Gomes');
+    assert.equal(fusionado.created, false, 'sin contradicción, el parecido debía fusionar');
+
+    const raw2 = new Database(dbPath, { readonly: true });
+    try {
+      const rows = raw2.prepare('SELECT person_id, submitted_name FROM merge_log').all();
+      assert.equal(rows.length, 1, 'la fusión que sí ocurrió debía quedar registrada');
+      assert.equal(rows[0].person_id, original.id);
+      assert.equal(rows[0].submitted_name, 'Jhon Alex Gomes');
+    } finally {
+      raw2.close();
+    }
+  } finally {
+    await store.close();
+    cleanup(dbPath);
+  }
+});
+
 test('SQLite: merge_log se borra solo cuando se borra la persona (misma retención que match_log/contact_log)', async () => {
   const dbPath = tempDbPath();
   const store = createStore(await createSqliteAdapter(dbPath));

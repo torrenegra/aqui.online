@@ -92,6 +92,15 @@ function createReportAdmission({
   // a transport difference, not a behavior one — the day the form grows a
   // "link to the news" field it passes `sourceUrl` and inherits the rule.
   //
+  // department / age: las señales con las que #150 decide NO fusionar a dos
+  // personas distintas cuyos nombres se parecen. Las tres puertas las aceptan y
+  // ninguna las exige — un reporte sin ellas entra igual, porque un reporte
+  // descartado es el peor resultado posible de esta app.
+  //
+  // No se normalizan acá, a diferencia de sourceUrl: la puerta es addUpdate en
+  // src/people.js, que ya es el único camino a la tabla. Un departamento fuera
+  // de la lista entra como null en vez de como texto que no compara con nada.
+  //
   // checkDuplicates / includePriorPhoto: each is its own Rekognition call or
   // extra store read, and only the web form and (for duplicates) the JSON API
   // render anything from them — the WhatsApp bot's reply never mentions a
@@ -109,6 +118,9 @@ function createReportAdmission({
     reporter = null,
     contact = null,
     externalId,
+    department = null,
+    age = null,
+    assertedPersonId = null,
     photos = [],
     skipAddresses = [],
     checkDuplicates = false,
@@ -178,7 +190,13 @@ function createReportAdmission({
       }
 
       // ---- 2. Find or create the person ----------------------------------
-      const { person, created } = await store.findOrCreatePerson(cleanName);
+      // Las señales entran acá porque deciden a quién pertenece el reporte, no
+      // solo qué se guarda de él.
+      const { person, created, blocked } = await store.findOrCreatePerson(cleanName, {
+        department,
+        age,
+        assertedPersonId
+      });
 
       // Read the record's existing report photo BEFORE this report's own
       // photos are stored — afterwards there is no way to tell which face was
@@ -201,7 +219,9 @@ function createReportAdmission({
         sourceUrl: cleanSourceUrl,
         reporter,
         contact,
-        externalId
+        externalId,
+        department,
+        age
       });
 
       // ---- 4. Resolve the ACTUAL owner -----------------------------------
@@ -211,6 +231,13 @@ function createReportAdmission({
       // before notifying, so alerts never reach the wrong subscribers and the
       // response never reports the wrong person. This is a system invariant,
       // not an API detail.
+      //
+      // Acá también gana el external_id sobre el veto de #150: si el que llama
+      // dice «esta es la misma ficha», esa afirmación de identidad pesa más que
+      // nuestro parecido de nombres, y respetarla es lo que evita que cada
+      // reenvío fabrique una fila nueva. El reporte vuelve a la persona de la
+      // que el veto lo separó, y `blocked` se vacía para no afirmar lo
+      // contrario.
       const owner =
         update.person_id === person.id
           ? person
@@ -222,12 +249,33 @@ function createReportAdmission({
       // findOrCreatePerson inserted a fresh row for the drifted name.
       const mergedIntoExisting = !created || String(owner.id) !== String(person.id);
 
-      return { ok: true, person, created, priorPhoto, update, owner, mergedIntoExisting };
+      return { ok: true, person, created, blocked, priorPhoto, update, owner, mergedIntoExisting };
     };
 
     const admitted = externalId ? await store.withExternalIdLock(externalId, admit) : await admit();
     if (!admitted.ok) return admitted;
-    const { created, priorPhoto, update, owner, mergedIntoExisting } = admitted;
+    const { person, created, blocked, priorPhoto, update, owner, mergedIntoExisting } = admitted;
+
+    // Y si el update se fue a otro dueño, la fila que acabamos de insertar se
+    // quedó sin nada. Una persona sin updates no es un registro a medias: es un
+    // pase libre. `mergeBlockReason` no puede vetar contra un historial vacío,
+    // así que el próximo nombre parecido —de cualquier departamento y cualquier
+    // edad— cae ahí sin que nada lo detenga, y #150 se reabre por el costado.
+    //
+    // Va después del write y antes de las cortesías, con la misma regla que
+    // ellas: si falla, se pierde la limpieza, nunca el reporte. Y va FUERA del
+    // lock: esta fila no tiene updates, así que no tiene llave externa que
+    // nadie pueda estar suprimiendo, y `deletePerson` pide su propia conexión
+    // del `lockPool` de dos — pedirla sin soltar la nuestra es justo el
+    // agotamiento que ese pool aparte existe para evitar.
+    const orphaned = created && String(owner.id) !== String(person.id);
+    if (orphaned) {
+      try {
+        if (!(await store.getUpdates(person.id)).length) await store.deletePerson(person.id);
+      } catch (e) {
+        console.error('[report-admission] no se pudo borrar la persona huérfana:', e && e.message);
+      }
+    }
 
     // ---- 5. Index the report photos ------------------------------------
     // processPhoto never throws for a matcher/Rekognition failure — it stores
@@ -281,7 +329,15 @@ function createReportAdmission({
     return {
       ok: true,
       person: owner,
-      personCreated: created,
+      // Se lee de dónde quedó el reporte, no de si insertamos una fila: cuando
+      // esa fila terminó huérfana y borrada, decir `true` le prometería al que
+      // llama una persona nueva que ya no existe — y contradiría a
+      // `mergedIntoExisting`, que en ese caso es `true` también.
+      personCreated: created && !orphaned,
+      // null, o { reason, personId, score }: con quién se habría fusionado y
+      // qué señal lo impidió. Vacío si `owner` terminó siendo esa misma
+      // persona, porque entonces el upsert por external_id deshizo el veto.
+      blocked: blocked && String(owner.id) !== String(blocked.personId) ? blocked : null,
       update,
       photos: storedPhotos,
       unreadablePhotos,
