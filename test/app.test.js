@@ -82,9 +82,10 @@ test('home lists missing people and offers both actions', async (t) => {
   t.after(() => server.close());
 
   const html = await (await fetch(base)).text();
-  assert.match(html, /tengo a alguien conmigo — mira quién lo busca/i);
+  assert.match(html, /Rescaté a alguien/);
+  assert.match(html, /Estoy buscando a alguien/);
   assert.match(html, /href="\/rescate"/);
-  assert.match(html, /📢 Reporta a la persona que buscas/);
+  assert.match(html, /href="\/report"/);
   // The sources line lives small under the listing, present even when empty.
   assert.match(html, /Fuentes de información de desaparecidos/);
 
@@ -107,6 +108,61 @@ test('home lists missing people and offers both actions', async (t) => {
   // No false "coming soon" promises: media and official channels don't expose a
   // scrapable photo registry, so they must not be listed as sources.
   assert.doesNotMatch(home, /Próximamente/);
+});
+
+// El home ofrece dos caminos y solo dos: el rescatista que encontró a alguien
+// (→ /rescate) y quien está buscando (→ /report). Cada uno con su espacio de
+// imagen reservado para que se distingan de un vistazo.
+test('home ofrece dos caminos claros, cada uno con su espacio de imagen', async (t) => {
+  const { server, base } = await startApp();
+  t.after(() => server.close());
+
+  const home = await (await fetch(base)).text();
+  assert.match(home, /<a class="path rescuer" href="\/rescate">/);
+  assert.match(home, /<a class="path family" href="\/report">/);
+  assert.match(home, /Rescaté a alguien/);
+  assert.match(home, /Estoy buscando a alguien/);
+  // Dos espacios de imagen, uno por camino, cada uno con su imagen.
+  assert.equal(home.match(/class="path-art"/g).length, 2);
+  assert.match(home, /<img src="\/img\/rescate\.jpg"/);
+  assert.match(home, /<img src="\/img\/busqueda\.jpg"/);
+});
+
+// Los dos caminos son <span>, no encabezados, así que la página necesita su
+// propio <h1>. Es la puerta de entrada del sitio: sin él, un lector de pantalla
+// y un buscador entran sin nada que diga qué es esto — y con la base vacía el
+// home se quedaba sin un solo encabezado.
+test('el home tiene un h1 y los encabezados bajan en orden', async (t) => {
+  const { server, base } = await startApp();
+  t.after(() => server.close());
+
+  const headingsOf = (html) =>
+    [...html.matchAll(/<(h[1-6])\b[^>]*>/g)].map((m) => Number(m[1][1]));
+
+  // Sin reportes todavía: el h1 tiene que estar igual.
+  const vacio = await (await fetch(base)).text();
+  assert.deepEqual(headingsOf(vacio), [1], 'con la base vacía el home es solo su h1');
+  assert.match(vacio, /<h1[^>]*>Personas desaparecidas por el terremoto en Colombia<\/h1>/);
+
+  const fd = new FormData();
+  fd.set('name', 'Pedro Pablo Ramírez');
+  fd.set('location', 'Barrio Centro');
+  fd.set('contact', '300 123 4567');
+  fd.append('photos', new File([Buffer.from('foto')], 'f.jpg', { type: 'image/jpeg' }));
+  const creado = await fetch(`${base}/report`, { method: 'POST', body: fd, redirect: 'manual' });
+  assert.equal(creado.status, 303);
+
+  const conReportes = await (await fetch(base)).text();
+  const niveles = headingsOf(conReportes);
+  assert.equal(niveles[0], 1, 'el primer encabezado de la página es el h1');
+  assert.equal(niveles.filter((n) => n === 1).length, 1, 'un solo h1 por página');
+  // Ningún salto: de un encabezado al siguiente se baja de a un nivel.
+  for (let i = 1; i < niveles.length; i++) {
+    assert.ok(
+      niveles[i] <= niveles[i - 1] + 1,
+      `salto de h${niveles[i - 1]} a h${niveles[i]}: el orden de encabezados se rompió`
+    );
+  }
 });
 
 // A second party reporting the same person is never rejected: the report is

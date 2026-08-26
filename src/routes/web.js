@@ -505,24 +505,28 @@ function webRoutes(store, matcher) {
         layout(
           'Inicio',
           `
-<section class="action-group">
-  <h1>Voluntarios, rescatistas, bomberos, policías y hospitales:</h1>
-  <a class="big-btn report" href="/rescate">
-    <span class="btn-title">🔍 Tengo a alguien conmigo — mira quién lo busca</span>
-    <span class="btn-sub">Subes una foto, la comparamos con IA y la borramos al instante</span>
+<!-- El encabezado de nivel 1 de la página. Los dos caminos de abajo son
+     hermanos con el mismo peso y ninguno titula la página, por eso van como
+     span y no como encabezado. Sin este, el home arrancaba en el nivel 2 del
+     listado de reportes — o sin ningún encabezado, cuando todavía no hay
+     reportes — que es como entrar a la puerta principal de un servicio de
+     emergencia sin que nada diga qué es esto. -->
+<h1 class="compact">Personas desaparecidas por el terremoto en Colombia</h1>
+<section class="paths">
+  <!-- Dos caminos, y nada más: el rescatista que encontró a alguien, y quien
+       está buscando. Cada uno lleva su propia imagen arriba para que se
+       reconozca de un vistazo, sin leer, cuál es el tuyo. El slot .path-art
+       queda reservado con su proporción aunque todavía no haya imagen: cuando
+       exista, se cae adentro sin recolocar nada. -->
+  <a class="path rescuer" href="/rescate">
+    <span class="path-art" aria-hidden="true"><img src="/img/rescate.jpg" alt="" width="800" height="533" loading="lazy" decoding="async"></span>
+    <span class="path-title">Rescaté a alguien</span>
+    <span class="path-sub">Subes una foto, la comparamos con IA y la borramos al instante</span>
   </a>
-</section>
-<section class="action-group">
-  <h2>¿Estás buscando a alguien?</h2>
-  <!-- Relleno sólido, no contorno: acá NO compite con el botón del rescatista
-       —está en su propia sección, con su propio encabezado— así que ponerlo en
-       contorno solo lo hacía menos visible que en producción hoy, justo el
-       camino que estos cambios existen para volver más visible. El contorno se
-       reserva para donde los dos botones sí comparten el ojo (la pareja de la
-       ficha), que es donde su trabajo es diferenciar. -->
-  <a class="big-btn search" href="/report">
-    <span class="btn-title">📢 Reporta a la persona que buscas</span>
-    <span class="btn-sub">Deja su foto y tu teléfono: quien la encuentre te llama directo</span>
+  <a class="path family" href="/report">
+    <span class="path-art" aria-hidden="true"><img src="/img/busqueda.jpg" alt="" width="800" height="533" loading="lazy" decoding="async"></span>
+    <span class="path-title">Estoy buscando a alguien</span>
+    <span class="path-sub">Deja su foto y tu teléfono: quien la encuentre te llama directo</span>
   </a>
 </section>
 ${list}

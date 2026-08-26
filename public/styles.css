@@ -142,6 +142,57 @@ h1.compact .subtle { font-family: var(--font-sans); font-weight: 400; font-size:
   margin: 0 0 0.7rem;
 }
 .action-group .big-btn { margin: 0; }
+
+/* Los dos caminos del home: rescatista y quien busca. Cada uno es una tarjeta
+   con una imagen arriba —el slot reservado con su proporción aunque aún no haya
+   imagen— para que se distingan de un vistazo, sin leer. En un teléfono van
+   apilados (una columna); con más ancho, lado a lado. */
+.paths {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 1rem;
+  margin: 1rem 0 2.6rem;
+}
+@media (min-width: 620px) {
+  .paths { grid-template-columns: 1fr 1fr; }
+}
+.path {
+  display: flex;
+  flex-direction: column;
+  border: 2px solid var(--accent);
+  border-radius: 14px;
+  overflow: hidden;
+  text-decoration: none;
+  color: inherit;
+  background: var(--surface);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.path:hover { box-shadow: 0 6px 20px rgba(31, 30, 29, 0.12); }
+.path:focus-visible { outline: 3px solid var(--accent-dark); outline-offset: 2px; }
+/* El espacio de la imagen. Proporción fija para que la página no salte cuando
+   la imagen entre; el fondo suave marca el hueco mientras tanto. Cuando se
+   agregue <img>, ocupa este mismo bloque. */
+.path-art {
+  display: block;
+  aspect-ratio: 3 / 2;
+  background: rgba(43, 108, 176, 0.08);
+  border-bottom: 1px solid rgba(43, 108, 176, 0.15);
+}
+.path-art img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.path-title {
+  display: block;
+  font-size: 1.25rem;
+  font-weight: 600;
+  text-align: center;
+  margin: 0.9rem 1rem 0;
+}
+.path-sub {
+  display: block;
+  font-size: 0.9rem;
+  text-align: center;
+  opacity: 0.85;
+  margin: 0.35rem 1rem 1.1rem;
+}
 .big-btn {
   display: block;
   text-align: center;
