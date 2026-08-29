@@ -172,6 +172,65 @@ test('either contact box on its own is enough, and neither is still an error', a
   assert.equal(neither.status, 400, 'sin ninguna forma de contactar no hay a quién avisar');
 });
 
+// #178: the form accepted any text in the phone box — letters, symbols,
+// whatever. Unlike /rescate's optional phone, a filled-in box here means the
+// value has to actually be usable.
+test('a contact phone that is not just digits gets rejected', async (t) => {
+  const { server, base } = await startApp();
+  t.after(() => server.close());
+
+  const withLetters = await report(base, { contact: '', contact_phone: 'abc123def45' });
+  assert.equal(withLetters.status, 400, 'letters mixed with digits are not a phone number');
+
+  const oneLetterMixedIn = await report(base, { contact: '', contact_phone: '300a1234567' });
+  assert.equal(
+    oneLetterMixedIn.status,
+    400,
+    'a single stray letter must not be silently stripped down to a valid digit count'
+  );
+
+  const tooShort = await report(base, { contact: '', contact_phone: '31044455' });
+  assert.equal(tooShort.status, 400, '8 digits are not enough');
+
+  const withSpaces = await report(base, { contact: '', contact_phone: '310 444 5566' });
+  assert.equal(withSpaces.status, 303, '10 digits with separator spaces still work');
+
+  const withCountryCode = await report(base, { contact: '', contact_phone: '573145556677' });
+  assert.equal(withCountryCode.status, 303, 'a country-code prefix also works, like /rescate');
+
+  const withPlusCountryCode = await report(base, { contact: '', contact_phone: '+573145556677' });
+  assert.equal(withPlusCountryCode.status, 303, 'a "+" before the country code also works');
+});
+
+// El 400 de este formulario es de página completa y /report lleva de 1 a 3
+// fotos obligatorias: rechazar un número se lleva también las fotos que la
+// familia acababa de subir. Así que solo se rechaza lo que de verdad no es un
+// teléfono — los separadores con los que se escribe un celular en Colombia los
+// limpia normalizePhone() igual.
+test('the usual ways of writing a Colombian mobile are accepted, separators included', async (t) => {
+  const { server, base } = await startApp();
+  t.after(() => server.close());
+
+  const dashes = await report(base, { contact: '', contact_phone: '300-123-4567' });
+  assert.equal(dashes.status, 303, 'guiones: forma corriente de escribirlo');
+
+  const parens = await report(base, { contact: '', contact_phone: '(300) 123 4567' });
+  assert.equal(parens.status, 303, 'paréntesis alrededor del indicativo');
+
+  const dots = await report(base, { contact: '', contact_phone: '300.123.4567' });
+  assert.equal(dots.status, 303, 'puntos como separador');
+
+  const plusAndDashes = await report(base, { contact: '', contact_phone: '+57 300-123-4567' });
+  assert.equal(plusAndDashes.status, 303, 'indicativo con "+" y guiones a la vez');
+
+  // El límite no se movió: lo que no es un teléfono sigue sin pasar.
+  const symbols = await report(base, { contact: '', contact_phone: '300#123*4567' });
+  assert.equal(symbols.status, 400, 'símbolos que no separan un número no son un teléfono');
+
+  const separatorsOnly = await report(base, { contact: '', contact_phone: '--- ()' });
+  assert.equal(separatorsOnly.status, 400, 'puros separadores no son un número');
+});
+
 test('every page ends with the two asks, contributors above the ColombiaTeBusca team', async (t) => {
   const { server, base } = await startApp();
   t.after(() => server.close());

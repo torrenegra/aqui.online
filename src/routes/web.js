@@ -10,7 +10,7 @@ const {
   forgetPersonFaces,
   MAX_QUERY_PHOTOS
 } = require('../facematch');
-const { esc, layout, updateCard, timeTag, facePlate, LOCATION_SCRIPT } = require('../html');
+const { esc, layout, updateCard, timeTag, facePlate, LOCATION_SCRIPT, PHONE_FILTER_SCRIPT } = require('../html');
 const { isReadyToShow } = require('../report-photo');
 const gh = require('../github');
 const { logContact, resultFromSend } = require('../logbook');
@@ -35,6 +35,14 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 // se puede quedar trancado en una validación de formato — el resto del
 // formulario sigue funcionando igual.
 const PHONE_DEFAULT_COUNTRY = '57';
+// Lo que una persona escribe cuando escribe un celular: dígitos y los
+// separadores con los que se agrupan acá — espacios, guiones, paréntesis del
+// indicativo y puntos — con un '+' opcional adelante. Todo eso lo limpia
+// normalizePhone() de todos modos, así que rechazarlo sería rechazar una forma
+// correcta de escribir el número. Lo que sí se rechaza es lo que no es un
+// teléfono: letras y cualquier otro símbolo, que normalizePhone() borraría en
+// silencio dejando pasar un valor que la persona nunca quiso ("300a1234567").
+const PHONE_RAW_RE = /^\+?[\d\s().-]+$/;
 function normalizePhone(raw) {
   let digits = String(raw || '')
     .replace(/\D/g, '')
@@ -661,7 +669,8 @@ ${
   <label class="field-label"><span>Tu correo (opcional — te avisamos si alguien la busca después)</span>
     <input type="email" name="email" value="${esc(email)}" placeholder="tucorreo@ejemplo.com" autocomplete="email"></label>
   <label class="field-label"><span>Tu WhatsApp (opcional — es por donde te llegamos más rápido)</span>
-    <input name="phone" value="${esc(phone)}" inputmode="tel" maxlength="40" placeholder="300 123 4567" autocomplete="tel"></label>
+    <input data-phone-filter name="phone" value="${esc(phone)}" inputmode="tel" maxlength="16" pattern="\\+?[0-9]{10,15}" placeholder="3001234567" autocomplete="tel">
+    <span class="field-hint-error" hidden>El teléfono ingresado no es válido.</span></label>
   ${searchOnlyCheckbox(searchOnly)}
   <button>🔎 Ver quién la está buscando</button>
 </form>
@@ -706,7 +715,8 @@ document.addEventListener('submit', function (ev) {
     picked.hidden = !has;
   });
 })();
-</script>`;
+</script>
+${PHONE_FILTER_SCRIPT}`;
   }
 
   router.get('/rescate', (req, res) => {
@@ -990,7 +1000,8 @@ ${RESCUE_FOOTER}`
       <datalist id="location-options"></datalist>
     </span></label>
   <label class="field-label"><span>Tu teléfono para que te contacten</span>
-    <input name="contact_phone" inputmode="tel" autocomplete="tel" maxlength="120" value="${esc(remembered.phone)}" placeholder="Ej. 300 123 4567"></label>
+    <input name="contact_phone" data-phone-filter inputmode="tel" autocomplete="tel" maxlength="16" pattern="\\+?[0-9]{10,15}" value="${esc(remembered.phone)}" placeholder="Ej. 3001234567">
+    <span class="field-hint-error" hidden>El teléfono ingresado no es válido.</span></label>
   <label class="field-label"><span>Tu correo</span>
     <input name="contact_email" type="email" inputmode="email" autocomplete="email" maxlength="120" value="${esc(remembered.email)}" placeholder="tucorreo@ejemplo.com"></label>
   <p class="subtle contact-note">Con uno basta.</p>
@@ -1009,6 +1020,7 @@ document.addEventListener('submit', function (ev) {
   }
 }, true);
 </script>
+${PHONE_FILTER_SCRIPT}
 ${LOCATION_SCRIPT}`,
         {
           fullTitle: 'Reporta una persona desaparecida — encontrados.co',
@@ -1038,6 +1050,23 @@ ${LOCATION_SCRIPT}`,
             layout(
               'Error',
               '<p class="error">Faltan datos: hacen falta las fotos, el nombre, el lugar y un teléfono o correo de contacto.</p>'
+            )
+          );
+      }
+      // Unlike /rescate's optional phone (which degrades silently), a filled-in
+      // box here means the reporter wants it used: a value that isn't a phone
+      // number (letters, symbols, too short) is rejected, not dropped.
+      // normalizePhone() alone isn't enough: it strips non-digits before
+      // counting them, so a letter mixed into an otherwise-valid number (e.g.
+      // "300a1234567") would silently pass. PHONE_RAW_RE rejects anything but
+      // digits, spaces, and a leading '+' before normalizePhone ever sees it.
+      if (phone && (!PHONE_RAW_RE.test(phone) || !normalizePhone(phone))) {
+        return res
+          .status(400)
+          .send(
+            layout(
+              'Error',
+              '<p class="error">El teléfono de contacto no es válido: escribe un número de celular de 10 dígitos.</p>'
             )
           );
       }

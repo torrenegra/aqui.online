@@ -426,6 +426,28 @@ const LOCATION_SCRIPT = `<script>
 })();
 </script>`;
 
+// Restricts any input marked `data-phone-filter` to digits and a single
+// leading '+' as the visitor types, and flags it invalid — a red border plus
+// the sibling `.field-hint-error` message — once what's left doesn't look
+// like a real phone number (10 digits, or 11-15 with a country code). Purely
+// a UX signal: whether an invalid value blocks submission is up to the page
+// (see /report's own server-side check vs. /rescate's deliberately lenient
+// one), not this script.
+const PHONE_FILTER_SCRIPT = `<script>
+document.addEventListener('input', function (ev) {
+  if (!ev.target || !ev.target.matches('[data-phone-filter]')) return;
+  var v = ev.target.value;
+  var plus = v.charAt(0) === '+' ? '+' : '';
+  v = plus + v.replace(/\\D/g, '').slice(0, 15);
+  ev.target.value = v;
+  var digits = plus ? v.length - 1 : v.length;
+  var valid = !v || digits === 10 || (digits >= 11 && digits <= 15);
+  ev.target.classList.toggle('field-invalid', !valid);
+  var hint = ev.target.parentElement.querySelector('.field-hint-error');
+  if (hint) hint.hidden = valid;
+}, true);
+</script>`;
+
 module.exports = {
   esc,
   layout,
@@ -436,5 +458,6 @@ module.exports = {
   facePlate,
   thumbnailsAreAffordable,
   PRIVACY_NOTE,
-  LOCATION_SCRIPT
+  LOCATION_SCRIPT,
+  PHONE_FILTER_SCRIPT
 };

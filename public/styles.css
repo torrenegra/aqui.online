@@ -525,6 +525,15 @@ button:disabled { opacity: 0.55; cursor: progress; }
   padding: 0.65rem 0.9rem;
   border-radius: 10px;
 }
+/* Per-field feedback (e.g. an invalid phone as you type), distinct from the
+   block-level .error message above: it sits right under one input instead
+   of interrupting the whole form. Explicit display rules because .field-label
+   is a flex container — a bare [hidden] attribute alone loses to the flex
+   item's blockified display and stays visible. */
+.field-hint-error { display: block; color: #c0392b; font-size: 0.8rem; margin: 0.1rem 0 0; }
+.field-hint-error[hidden] { display: none; }
+input.field-invalid,
+input.field-invalid:focus { border-color: #c0392b; }
 .privacy {
   background: #f4efe4;
   border: 1px solid var(--border-strong);
