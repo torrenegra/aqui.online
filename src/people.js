@@ -401,6 +401,43 @@ function createStore(adapter) {
     return adapter.matchLogSimilarityRows();
   }
 
+  // --- Llaves de API por persona ------------------------------------------
+  // Paso directo al adapter, igual que las bitácoras. La decisión de qué puede
+  // hacer una llave NO vive acá: vive en la puerta (src/routes/api.js). Acá
+  // solo se abre el paso, porque este facade es una lista explícita y un método
+  // que no aparezca en ella no existe para el resto de la app.
+  async function insertApiKey(fields) {
+    return adapter.insertApiKey(fields);
+  }
+
+  async function apiKeyByHash(keyHash) {
+    return adapter.apiKeyByHash(keyHash);
+  }
+
+  async function apiKeysList() {
+    return adapter.apiKeysList();
+  }
+
+  async function revokeApiKey(id, revokedAt) {
+    return adapter.revokeApiKey(id, revokedAt);
+  }
+
+  async function touchApiKeyUsed(id, nowIso, staleBeforeIso) {
+    return adapter.touchApiKeyUsed(id, nowIso, staleBeforeIso);
+  }
+
+  async function insertApiWriteLog(fields) {
+    return adapter.insertApiWriteLog(fields);
+  }
+
+  async function apiWriteOwnerByExternalId(externalId) {
+    return adapter.apiWriteOwnerByExternalId(externalId);
+  }
+
+  async function countApiWrites(apiKeyId, sinceIso) {
+    return adapter.countApiWrites(apiKeyId, sinceIso);
+  }
+
   return {
     STATUSES,
     SOURCES,
@@ -460,6 +497,14 @@ function createStore(adapter) {
     updatesBeyondFirstBySource,
     queryPhotoPeople,
     matchLogSimilarityRows,
+    insertApiKey,
+    apiKeyByHash,
+    apiKeysList,
+    revokeApiKey,
+    touchApiKeyUsed,
+    insertApiWriteLog,
+    apiWriteOwnerByExternalId,
+    countApiWrites,
     close: () => adapter.close()
   };
 }

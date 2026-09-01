@@ -220,6 +220,44 @@ async function createSqliteAdapter(dbPath) {
     CREATE INDEX IF NOT EXISTS idx_status_review_person ON status_review(person_id);
     CREATE INDEX IF NOT EXISTS idx_status_review_created ON status_review(created_at);
     -- ===== COLA DE REVISIÓN DE ESTADO (#190) — fin ========================
+
+    -- Llaves de API por persona. Mismas reglas que en Postgres (ver el
+    -- comentario largo de allá): de la llave solo se guarda su SHA-256 y un
+    -- prefijo para poder distinguirlas en una lista, label es un ALIAS público
+    -- y no el nombre legal de nadie, y una fila no se borra: se revoca.
+    -- revoked_at y last_used_at van como TEXTO ISO en los dos motores porque se
+    -- comparan en JS. created_by guarda la CUENTA DE OPERACIÓN que emitió la
+    -- llave —un correo de ADMIN_EMAILS, nunca texto libre— y el por qué de esa
+    -- distinción está en el comentario de Postgres.
+    CREATE TABLE IF NOT EXISTS api_keys (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      label TEXT NOT NULL,
+      key_hash TEXT NOT NULL UNIQUE,
+      key_prefix TEXT NOT NULL,
+      scope TEXT NOT NULL CHECK (scope IN ('operator','ingest')),
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+      created_by TEXT,
+      revoked_at TEXT,
+      last_used_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
+
+    -- Quién escribió qué. Misma forma y misma retención que
+    -- match_log/contact_log: solo ids y enums, y ON DELETE CASCADE sobre
+    -- people(id). api_key_id nulo = la llave de entorno API_KEY, que no tiene
+    -- fila. Ver el comentario de Postgres para la dependencia que crea: esta
+    -- bitácora es también la prueba de qué llave creó cada ficha.
+    CREATE TABLE IF NOT EXISTS api_write_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+      update_id INTEGER REFERENCES updates(id) ON DELETE CASCADE,
+      api_key_id INTEGER REFERENCES api_keys(id),
+      action TEXT NOT NULL CHECK (action IN ('crear','actualizar')),
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_api_write_log_person ON api_write_log(person_id);
+    CREATE INDEX IF NOT EXISTS idx_api_write_log_update ON api_write_log(update_id);
+    CREATE INDEX IF NOT EXISTS idx_api_write_log_key_created ON api_write_log(api_key_id, created_at);
   `);
 
   // Older dev databases: add the GPS columns if missing.
@@ -860,6 +898,70 @@ async function createSqliteAdapter(dbPath) {
         .all(personId);
     },
     // ===== COLA DE REVISIÓN DE ESTADO (#190) — fin ========================
+    // --- Llaves de API por persona -------------------------------------
+    // Espejo exacto del adapter de Postgres; el POR QUÉ de cada una está allá.
+    // La llave en claro no entra acá nunca: quien emite hashea antes de llamar.
+    async insertApiKey({ label, keyHash, keyPrefix, scope, createdBy }) {
+      const info = db
+        .prepare(
+          'INSERT INTO api_keys (label, key_hash, key_prefix, scope, created_by) VALUES (?, ?, ?, ?, ?)'
+        )
+        .run(label, keyHash, keyPrefix, scope, createdBy || null);
+      return db.prepare('SELECT * FROM api_keys WHERE id = ?').get(info.lastInsertRowid);
+    },
+    // Devuelve la fila incluso revocada, a propósito: quien verifica necesita
+    // distinguir "no existe" de "se revocó".
+    async apiKeyByHash(keyHash) {
+      return db.prepare('SELECT * FROM api_keys WHERE key_hash = ?').get(keyHash);
+    },
+    async apiKeysList() {
+      return db
+        .prepare(
+          `SELECT id, label, key_prefix, scope, created_at, created_by, revoked_at, last_used_at
+           FROM api_keys ORDER BY id`
+        )
+        .all();
+    },
+    async revokeApiKey(id, revokedAt) {
+      const info = db
+        .prepare('UPDATE api_keys SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL')
+        .run(revokedAt, id);
+      if (!info.changes) return undefined;
+      return db.prepare('SELECT * FROM api_keys WHERE id = ?').get(id);
+    },
+    async touchApiKeyUsed(id, nowIso, staleBeforeIso) {
+      db.prepare(
+        `UPDATE api_keys SET last_used_at = ?
+         WHERE id = ? AND (last_used_at IS NULL OR last_used_at < ?)`
+      ).run(nowIso, id, staleBeforeIso);
+    },
+    async insertApiWriteLog({ personId, updateId, apiKeyId, action }) {
+      db.prepare(
+        'INSERT INTO api_write_log (person_id, update_id, api_key_id, action) VALUES (?, ?, ?, ?)'
+      ).run(personId, updateId ?? null, apiKeyId ?? null, action);
+    },
+    // Gana la fila MÁS ANTIGUA de la bitácora: quien creó la ficha, no quien la
+    // tocó de último. Sin NULLS LAST (que SQLite solo entiende desde 3.30): no
+    // hace falta, porque la única forma de que api_key_id venga nulo acá es que
+    // no exista NINGUNA fila de bitácora, y entonces el LEFT JOIN devuelve
+    // exactamente una.
+    async apiWriteOwnerByExternalId(externalId) {
+      return db
+        .prepare(
+          `SELECT u.id AS update_id, l.api_key_id
+           FROM updates u
+           LEFT JOIN api_write_log l ON l.update_id = u.id
+           WHERE u.external_id = ?
+           ORDER BY l.id ASC
+           LIMIT 1`
+        )
+        .get(externalId);
+    },
+    async countApiWrites(apiKeyId, sinceIso) {
+      return db
+        .prepare('SELECT COUNT(*) AS n FROM api_write_log WHERE api_key_id = ? AND created_at >= ?')
+        .get(apiKeyId, sinceIso).n;
+    },
     // Cuenta total y por superficie. `since` (ISO) filtra a lo escrito desde
     // ahí — se usa para la línea de "cambio desde el reporte anterior" del
     // correo operativo; sin `since`, es el acumulado histórico completo.

@@ -40,7 +40,7 @@ reconocimiento facial y el correo quedan apagados, igual que fuera de Docker.
 
 1. Importa el repo en Vercel (framework: **Other**). `vercel.json` enruta todo a la función `api/index.js` (Express completo); `/public` lo sirve el CDN.
 2. Agrega **Vercel Postgres / Neon** al proyecto → define `POSTGRES_URL` (o `DATABASE_URL`). El esquema y los índices `pg_trgm` se crean solos en el primer arranque.
-3. Variables de entorno (ver `.env.example`): `BASE_URL`, `SENDGRID_API_KEY` (remitente fijo: `a@torrenegra.com`), `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_REGION` (Rekognition), y cuando haya credenciales de WhatsApp: `WHATSAPP_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_VERIFY_TOKEN`. Opcional: `API_KEY`.
+3. Variables de entorno (ver `.env.example`): `BASE_URL`, `SENDGRID_API_KEY` (remitente fijo: `a@torrenegra.com`), `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_REGION` (Rekognition), y cuando haya credenciales de WhatsApp: `WHATSAPP_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_VERIFY_TOKEN`. Opcional: `API_KEY` (obligatoria si se emiten llaves con alcance — ver [`docs/llaves-de-api.md`](docs/llaves-de-api.md)).
 
 ### WhatsApp (Meta Cloud API) — pendiente de credenciales; el canal está implementado pero sin referencias en la interfaz hasta activarlo
 
@@ -52,6 +52,15 @@ reconocimiento facial y el correo quedan apagados, igual que fuera de Docker.
 ## API
 
 Lecturas públicas; si defines `API_KEY`, los POST requieren `Authorization: Bearer <API_KEY>`.
+
+`API_KEY` es la llave de **operación**: abre las siete superficies con llave,
+incluido el `DELETE` irreversible. Para que alguien aporte datos sin recibir todo
+eso se emiten llaves con alcance acotado, guardadas en la base
+(`npm run api-key -- emitir --alias voluntario-1 --alcance ingest --emisor <correo>`)
+— ver
+[`docs/llaves-de-api.md`](docs/llaves-de-api.md). Una llave `ingest` solo puede
+usar `POST /api/updates`, solo afirma `missing`/`unknown`, no puede sobreescribir
+fichas que no creó y no le manda avisos a nadie.
 
 ```bash
 # Reportar (crea la persona si no existe; matching difuso para no duplicar)

@@ -19,6 +19,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
+const env = require('../src/env');
 const { createSqliteAdapter } = require('../src/store/sqlite');
 const { createStore } = require('../src/people');
 const { createApp } = require('../src/server');
@@ -130,8 +131,11 @@ test('un origen que no manda enlace guarda null, no undefined', async () => {
 test('POST /api/updates guarda source_url y lo devuelve en la ficha', async (t) => {
   const app = await startApp();
   t.after(() => app.server.close());
-  process.env.API_KEY = 'test-key';
-  t.after(() => { delete process.env.API_KEY; });
+  // env.API_KEY, no process.env.API_KEY: src/env.js copia el entorno al
+  // cargarse, así que ponerla después no exigía nada y estas pruebas venían
+  // pasando por el camino SIN llave sin querer.
+  env.API_KEY = 'test-key';
+  t.after(() => { env.API_KEY = ''; });
 
   const res = await fetch(`${app.base}/api/updates`, {
     method: 'POST',
@@ -166,8 +170,11 @@ test('un update sin source_url no inventa ningún enlace', async (t) => {
 test('source_url solo acepta http(s): un javascript: se descarta sin tumbar el reporte', async (t) => {
   const app = await startApp();
   t.after(() => app.server.close());
-  process.env.API_KEY = 'test-key';
-  t.after(() => { delete process.env.API_KEY; });
+  // env.API_KEY, no process.env.API_KEY: src/env.js copia el entorno al
+  // cargarse, así que ponerla después no exigía nada y estas pruebas venían
+  // pasando por el camino SIN llave sin querer.
+  env.API_KEY = 'test-key';
+  t.after(() => { env.API_KEY = ''; });
 
   // El caso que importa: alguien con la API key manda un esquema peligroso.
   // El reporte tiene que entrar igual — perder el aviso de que una persona
@@ -197,8 +204,11 @@ test('source_url solo acepta http(s): un javascript: se descarta sin tumbar el r
 test('un re-push con el mismo external_id refresca el enlace', async (t) => {
   const app = await startApp();
   t.after(() => app.server.close());
-  process.env.API_KEY = 'test-key';
-  t.after(() => { delete process.env.API_KEY; });
+  // env.API_KEY, no process.env.API_KEY: src/env.js copia el entorno al
+  // cargarse, así que ponerla después no exigía nada y estas pruebas venían
+  // pasando por el camino SIN llave sin querer.
+  env.API_KEY = 'test-key';
+  t.after(() => { env.API_KEY = ''; });
 
   const post = (sourceUrl) =>
     fetch(`${app.base}/api/updates`, {

@@ -18,6 +18,7 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const sharp = require('sharp');
+const env = require('../src/env');
 const { createSqliteAdapter } = require('../src/store/sqlite');
 const { createApp } = require('../src/server');
 const { fakeSendgrid, fakeWhatsApp } = require('./helpers');
@@ -873,12 +874,15 @@ test('la foto ilegible sin la casilla marcada no inventa que la marcaron', async
 // y respondía `pending_verification: true` por algo que nunca iba a llegar.
 test('suscribir un WhatsApp por la API no dispara un correo de verificación', async (t) => {
   const sg = await fakeSendgrid();
-  process.env.API_KEY = 'llave-de-prueba';
+  // env.API_KEY, no process.env.API_KEY: src/env.js copia el entorno al
+  // cargarse, así que ponerla después no exige nada y estas dos pruebas venían
+  // pasando por el camino SIN llave sin querer.
+  env.API_KEY = 'llave-de-prueba';
   const app = await startApp();
   t.after(() => {
     sg.stop();
     app.server.close();
-    delete process.env.API_KEY;
+    env.API_KEY = '';
   });
 
   const { person } = await app.store.findOrCreatePerson('Rosa Elvira Prueba');
@@ -898,12 +902,15 @@ test('suscribir un WhatsApp por la API no dispara un correo de verificación', a
 
 test('suscribir un correo por la API sí sigue pidiendo verificación', async (t) => {
   const sg = await fakeSendgrid();
-  process.env.API_KEY = 'llave-de-prueba';
+  // env.API_KEY, no process.env.API_KEY: src/env.js copia el entorno al
+  // cargarse, así que ponerla después no exige nada y estas dos pruebas venían
+  // pasando por el camino SIN llave sin querer.
+  env.API_KEY = 'llave-de-prueba';
   const app = await startApp();
   t.after(() => {
     sg.stop();
     app.server.close();
-    delete process.env.API_KEY;
+    env.API_KEY = '';
   });
 
   const { person } = await app.store.findOrCreatePerson('Rosa Elvira Prueba');

@@ -350,6 +350,103 @@ async function createPostgresAdapter(connectionString) {
     CREATE INDEX IF NOT EXISTS idx_status_review_person ON status_review(person_id);
     CREATE INDEX IF NOT EXISTS idx_status_review_created ON status_review(created_at);
     -- ===== COLA DE REVISIÓN DE ESTADO (#190) — fin ========================
+
+    -- Llaves de API por persona. Hasta acá existía UNA sola llave (la variable
+    -- de entorno API_KEY) que abría las siete superficies con llave del API,
+    -- incluido el DELETE irreversible que se lleva las firmas faciales.
+    -- Repartirla para que un voluntario aporte fichas era repartir escritura
+    -- total a produccion sobre datos de personas desaparecidas. Esta tabla
+    -- permite emitir llaves que puedan MUCHO menos (ver la columna scope).
+    --
+    -- Tres reglas que están en las columnas y conviene leer juntas:
+    --   1. key_hash guarda el SHA-256 hex de la llave, y la llave en claro NO
+    --      se guarda nunca, en ningún lado. Se muestra una sola vez, al
+    --      emitirla; perdida, se revoca y se emite otra. No hace falta bcrypt:
+    --      la llave es aleatoria de alta entropía, no una contraseña que haya
+    --      que estirar contra un diccionario.
+    --   2. key_prefix son los primeros caracteres de la llave en claro — lo
+    --      único que se puede mostrar en una lista para distinguir dos llaves
+    --      sin tener el secreto de ninguna.
+    --   3. label es un ALIAS PÚBLICO del dueño, a propósito: no el nombre
+    --      legal, no el correo, no el teléfono. Lo mínimo para saber a quién
+    --      revocarle. Guardar más convertiría esta tabla en un registro de
+    --      datos personales de voluntarios, con su propia retención que habría
+    --      que definir (Ley 1581).
+    --
+    -- Una fila NUNCA se borra: se revoca (revoked_at). Borrarla se llevaría el
+    -- único rastro de qué escribió esa llave, que es justo lo que hace falta
+    -- para limpiar después de revocarla.
+    --
+    -- created_by guarda QUIÉN emitió la llave, y lo único que hace que eso no
+    -- contradiga la regla 3 de arriba es QUÉ VALORES acepta: un correo que ya
+    -- está en ADMIN_EMAILS, o sea una de las pocas cuentas que administran esta
+    -- instalación. Es una REFERENCIA A UNA CUENTA DE OPERACIÓN, nunca texto
+    -- libre. La distinción es la que resuelve la objeción de privacidad: hubo
+    -- antes una bandera (--por) que aceptaba lo que alguien tecleara, y por ahí
+    -- entraba justo el nombre legal o el correo de un voluntario; se quitó. Con
+    -- la regla nueva ese dato no puede entrar, porque el conjunto de valores
+    -- posibles es la allowlist y nada más. Quien lo valida es scripts/api-key.js
+    -- contra isAllowedEmail (src/adminAuth.js) — el esquema no lo puede exigir,
+    -- porque la allowlist vive en el entorno y no en la base.
+    --
+    -- Para qué hace falta: la emisión se delega a personas de confianza, y una
+    -- llave emitida tiene que poder revocarla quien la emitió además de los
+    -- administradores. Sin este dato esa regla no se puede escribir. Ojo con lo
+    -- que la columna todavía NO es: es el DATO, no el control. Hoy el CLI ya
+    -- implica poder total y no hay sesión contra la cual aplicar autoridad
+    -- alguna; eso llega con el panel de /admin. Las filas emitidas antes de esta
+    -- regla quedan en NULL, y ese NULL significa "no se registró", no "nadie".
+    --
+    -- revoked_at y last_used_at van como TEXTO ISO en los DOS motores, por la
+    -- misma razón que subscriptions.rescue_asked_at: se leen y se comparan en
+    -- JS, y un TIMESTAMPTZ volvería como Date acá y como string en SQLite —
+    -- dos formas del mismo dato es lo que se cuela en producción y no en las
+    -- pruebas. created_at sí queda nativo, como en el resto del esquema:
+    -- nadie lo compara en JS.
+    CREATE TABLE IF NOT EXISTS api_keys (
+      id SERIAL PRIMARY KEY,
+      label TEXT NOT NULL,
+      key_hash TEXT NOT NULL UNIQUE,
+      key_prefix TEXT NOT NULL,
+      scope TEXT NOT NULL CHECK (scope IN ('operator','ingest')),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      created_by TEXT,
+      revoked_at TEXT,
+      last_used_at TEXT
+    );
+    -- La verificación de CADA request con llave es exactamente esta búsqueda,
+    -- así que el índice no es un lujo.
+    CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
+
+    -- Quién escribió qué. Sin esta bitácora se puede revocar una llave mala y
+    -- quedar igual de ciego: sin saber qué fichas tocó, no se puede limpiar.
+    -- Misma forma que match_log/contact_log —SOLO ids y enums, nunca texto
+    -- libre— y la MISMA retención: ON DELETE CASCADE sobre people(id), así que
+    -- un borrado a solicitud se la lleva.
+    --
+    -- api_key_id nulo significa "la llave de entorno API_KEY", que no tiene
+    -- fila. Es información, no un hueco: distingue lo que escribió el operador
+    -- de lo que escribió una llave emitida.
+    --
+    -- Ojo con la dependencia que esto crea, porque es la única de su tipo en el
+    -- esquema: la fila más antigua de una ficha es también la prueba de qué
+    -- llave la creó, y de ahí sale la regla de que una llave de ingesta no
+    -- pueda pisar lo ajeno. Si la bitácora no se pudo escribir, la ficha queda
+    -- SIN dueño demostrable y la regla la rechaza — falla cerrado, que es la
+    -- dirección correcta.
+    CREATE TABLE IF NOT EXISTS api_write_log (
+      id SERIAL PRIMARY KEY,
+      person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+      update_id INTEGER REFERENCES updates(id) ON DELETE CASCADE,
+      api_key_id INTEGER REFERENCES api_keys(id),
+      action TEXT NOT NULL CHECK (action IN ('crear','actualizar')),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_api_write_log_person ON api_write_log(person_id);
+    CREATE INDEX IF NOT EXISTS idx_api_write_log_update ON api_write_log(update_id);
+    -- El techo de escrituras por hora de una llave es un COUNT sobre estas dos
+    -- columnas, en el camino de CADA escritura suya.
+    CREATE INDEX IF NOT EXISTS idx_api_write_log_key_created ON api_write_log(api_key_id, created_at);
   `);
   if (hasTrgm) {
     await pool.query(`
@@ -1106,6 +1203,86 @@ async function createPostgresAdapter(connectionString) {
       );
     },
     // ===== COLA DE REVISIÓN DE ESTADO (#190) — fin ========================
+    // --- Llaves de API por persona -------------------------------------
+    // La llave en claro no entra acá NUNCA: quien emite hashea antes de llamar
+    // (hashApiKey vive en src/routes/api.js, junto a la verificación).
+    async insertApiKey({ label, keyHash, keyPrefix, scope, createdBy }) {
+      return one(
+        `INSERT INTO api_keys (label, key_hash, key_prefix, scope, created_by)
+         VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+        [label, keyHash, keyPrefix, scope, createdBy || null]
+      );
+    },
+    // Devuelve la fila INCLUSO si está revocada, a propósito: quien verifica
+    // necesita distinguir "esta llave no existe" de "existía y se revocó".
+    // Filtrar acá por revoked_at IS NULL haría que una llave revocada se vea
+    // igual que un token inventado — y en el modo de desarrollo sin API_KEY eso
+    // significaría caer al camino abierto, o sea que revocar ABRIRÍA.
+    async apiKeyByHash(keyHash) {
+      return one('SELECT * FROM api_keys WHERE key_hash = $1', [keyHash]);
+    },
+    // Sin key_hash: nada que consuma un listado lo necesita, y no exponerlo es
+    // gratis.
+    async apiKeysList() {
+      return all(
+        `SELECT id, label, key_prefix, scope, created_at, created_by, revoked_at, last_used_at
+         FROM api_keys ORDER BY id`
+      );
+    },
+    // Idempotente: revocar dos veces conserva la primera fecha. Devuelve fila
+    // solo si esta llamada fue la que revocó.
+    async revokeApiKey(id, revokedAt) {
+      return one(
+        'UPDATE api_keys SET revoked_at = $2 WHERE id = $1 AND revoked_at IS NULL RETURNING *',
+        [id, revokedAt]
+      );
+    },
+    // "Último uso" con throttle, en UN solo statement a propósito: leer,
+    // decidir y escribir desde JS sería una carrera entre instancias por un
+    // dato que a nadie le importa al segundo. staleBeforeIso es la marca a
+    // partir de la cual vale la pena reescribir.
+    async touchApiKeyUsed(id, nowIso, staleBeforeIso) {
+      await pool.query(
+        `UPDATE api_keys SET last_used_at = $2
+         WHERE id = $1 AND (last_used_at IS NULL OR last_used_at < $3)`,
+        [id, nowIso, staleBeforeIso]
+      );
+    },
+    async insertApiWriteLog({ personId, updateId, apiKeyId, action }) {
+      await pool.query(
+        'INSERT INTO api_write_log (person_id, update_id, api_key_id, action) VALUES ($1, $2, $3, $4)',
+        [personId, updateId ?? null, apiKeyId ?? null, action]
+      );
+    },
+    // De quién es el external_id que un llamador quiere reescribir:
+    //   undefined          → no hay ninguna ficha con ese id: está libre.
+    //   { api_key_id: null } → la escribió la llave de entorno, o la bitácora no
+    //                        alcanzó a registrarla. En los dos casos NO es de
+    //                        una llave emitida.
+    //   { api_key_id: 7 }  → la escribió la llave 7.
+    // Gana la fila MÁS ANTIGUA de la bitácora: quien creó la ficha, no quien la
+    // tocó de último.
+    async apiWriteOwnerByExternalId(externalId) {
+      return one(
+        `SELECT u.id AS update_id, l.api_key_id
+         FROM updates u
+         LEFT JOIN api_write_log l ON l.update_id = u.id
+         WHERE u.external_id = $1
+         ORDER BY l.id ASC NULLS LAST
+         LIMIT 1`,
+        [externalId]
+      );
+    },
+    // El techo por hora de una llave. Se cuenta sobre la bitácora y no sobre un
+    // contador en memoria porque en Vercel hay varias instancias, y un contador
+    // por instancia multiplica el techo por el número de instancias.
+    async countApiWrites(apiKeyId, sinceIso) {
+      const row = await one(
+        'SELECT COUNT(*)::int AS n FROM api_write_log WHERE api_key_id = $1 AND created_at >= $2',
+        [apiKeyId, sinceIso]
+      );
+      return row ? row.n : 0;
+    },
     // Cuenta total y por superficie. `since` (ISO) filtra a lo escrito desde
     // ahí — se usa para la línea de "cambio desde el reporte anterior" del
     // correo operativo; sin `since`, es el acumulado histórico completo.

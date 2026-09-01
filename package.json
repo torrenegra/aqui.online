@@ -7,6 +7,7 @@
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "seed": "node scripts/seed.js",
+    "api-key": "node scripts/api-key.js",
     "test": "node --test \"test/**/*.test.js\""
   },
   "engines": {
