@@ -32,11 +32,27 @@
 # ---------------------------------------------------------------------------
 
 
-# === Por defecto: los cuatro mantenedores core =============================
-# La aprobación de cualquiera de los cuatro alcanza. Acá vive lo rutinario, que
+# === Por defecto: mantenedores core + revisores ============================
+# La aprobación de cualquiera de los de abajo alcanza. Acá vive lo rutinario, que
 # es la mayoría del repo: corrección de errores, refactors sin cambio de
 # comportamiento observable, pruebas, estilos y documentación.
-*                            @torrenegra @cris-pappcorn @ni500 @yesid-lopez
+#
+# Esta línea y los bloques restringidos de abajo son, juntos, la definición del
+# anillo: **quien aparece SOLO acá revisa lo rutinario y nada más**. No es un
+# título ni una antesala a otra cosa — es exactamente el permiso que dice.
+# Hoy están en esa situación @cris-pappcorn (el agente) y @bit2424.
+*                            @torrenegra @cris-pappcorn @ni500 @yesid-lopez @bit2424
+
+# Sobre @bit2424 (Nelson David Quiñones Virgen): entró el 20-ago-2026 al anillo
+# de revisores, por el mismo camino escalonado de @yesid-lopez y contra el mismo
+# dato que lo justificó entonces —la cola—: ese día había 12 PRs abiertos y los
+# 12 esperaban a un humano, porque los 12 tocaban alguna ruta restringida.
+#
+# Conviene decir lo que su entrada NO resuelve, para que nadie lo mida contra la
+# expectativa equivocada: no destraba sus propios PRs (nadie aprueba el suyo), y
+# como la cola de ese día era toda restringida, tampoco la vacía. Lo que hace es
+# que el trabajo rutinario que llegue de acá en adelante deje de esperar a que
+# coincidan tres agendas.
 
 # Sobre @yesid-lopez: entró el 14-ago-2026 y el alcance se le amplió por
 # anillos —14-ago el catch-all y la superficie pública del API, 18-ago el resto
