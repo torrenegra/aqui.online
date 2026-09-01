@@ -51,10 +51,19 @@ test('el formulario de reporte ya no ofrece publicar en un registro de terceros'
   assert.doesNotMatch(html, /name="colombiatebusca"/);
   assert.doesNotMatch(html, /Reportar también en ColombiaTeBusca/i);
   // Las casillas que solo existían para llenar SU formulario se van con ella.
-  for (const field of ['reporter_name', 'department', 'municipality', 'place']) {
+  //
+  // `department` no está en esta lista, y la ausencia es deliberada: #150 lo
+  // volvió a pedir por una razón propia de esta app —es la señal que impide
+  // fusionar a dos personas distintas de nombre parecido—, no para llenar el
+  // formulario de un tercero. Lo que esta prueba tiene que seguir garantizando
+  // es que no vuelva como parte del relevo, y eso se afirma abajo: el que
+  // existe es un <select> del formulario principal, no el <input> del grupo
+  // desplegable que se retiró.
+  for (const field of ['reporter_name', 'municipality', 'place']) {
     assert.doesNotMatch(html, new RegExp(`name="${field}"`), `sobra la casilla ${field}`);
   }
   assert.doesNotMatch(html, /ctb-fields/);
+  assert.doesNotMatch(html, /<input[^>]*name="department"/, 'el departamento del relevo no puede volver');
 
   // Y el estilo del grupo desplegable tampoco se queda rondando en la hoja.
   const css = fs.readFileSync(path.join(__dirname, '..', 'public', 'styles.css'), 'utf8');

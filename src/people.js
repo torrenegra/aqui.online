@@ -3,6 +3,7 @@
 const crypto = require('crypto');
 const { normalize, phoneticKey, titleCaseName, matchScore } = require('./names');
 const { logMerge } = require('./logbook');
+const { canonicalDepartment } = require('./departments');
 
 const STATUSES = ['safe', 'injured', 'missing', 'deceased', 'unknown'];
 // 'aggregator': updates pushed by an external data aggregator, distinct from
@@ -22,6 +23,26 @@ const RESCUE_ANCHOR_PREFIX = 'Persona rescatada ';
 // sin tildes) — derivada con la misma normalize() que usa el resto del
 // esquema, no una copia a mano de la regla.
 const RESCUE_ANCHOR_NORMALIZED_PREFIX = `${normalize(RESCUE_ANCHOR_PREFIX)} `;
+
+// La edad declarada, o null si no llegó o no es creíble.
+//
+// El rango (0..120) no está para validarle nada a nadie: está para que un dedazo
+// —«2024» en la casilla de edad, un año en vez de una edad— no se guarde como
+// una señal que después separe a dos reportes de la misma persona. Fuera de
+// rango se trata como "no declarado", que es lo que en realidad es.
+//
+// Se redondea porque la comparación de #150 es por margen de años: media edad
+// no significa nada y complicaría el tipo de la columna en los dos motores.
+// Solo número o texto: `Number(true)` es 1 y `Number([7])` es 7, así que un
+// JSON con `"age": true` entraría como una edad declarada de un año.
+function parseAge(value) {
+  if (typeof value !== 'number' && typeof value !== 'string') return null;
+  if (String(value).trim() === '') return null;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  const age = Math.round(n);
+  return age >= 0 && age <= 120 ? age : null;
+}
 
 // Postgres returns Date objects; SQLite returns strings. Present ISO strings everywhere.
 function isoRow(row) {
@@ -67,7 +88,18 @@ function createStore(adapter) {
     return { person: isoRow(person), created: true };
   }
 
-  async function addUpdate(personId, { status, message, location, lat, lng, source, sourceUrl, reporter, contact, externalId }) {
+  // `department` y `age` son las señales con las que #150 separa a dos personas
+  // que comparten un nombre parecido. Se guardan canonicalizadas o no se
+  // guardan: un departamento fuera de la lista entra como null, porque un valor
+  // que no compara con nada es indistinguible de no tener el dato.
+  //
+  // La normalización vive acá y no en cada handler por la misma razón que
+  // `normalizeSourceUrl` vive en report-admission: una regla repetida en tres
+  // puertas es una regla que se afloja en dos de ellas sin que nadie lo note.
+  async function addUpdate(
+    personId,
+    { status, message, location, lat, lng, source, sourceUrl, reporter, contact, externalId, department, age }
+  ) {
     if (!STATUSES.includes(status)) throw new Error(`Invalid status: ${status}`);
     return isoRow(
       await adapter.insertUpdate(personId, {
@@ -80,7 +112,9 @@ function createStore(adapter) {
         sourceUrl,
         reporter,
         contact,
-        externalId
+        externalId,
+        department: canonicalDepartment(department),
+        age: parseAge(age)
       })
     );
   }

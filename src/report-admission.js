@@ -92,6 +92,15 @@ function createReportAdmission({
   // a transport difference, not a behavior one — the day the form grows a
   // "link to the news" field it passes `sourceUrl` and inherits the rule.
   //
+  // department / age: las señales con las que #150 decide NO fusionar a dos
+  // personas distintas cuyos nombres se parecen. Las tres puertas las aceptan y
+  // ninguna las exige — un reporte sin ellas entra igual, porque un reporte
+  // descartado es el peor resultado posible de esta app.
+  //
+  // No se normalizan acá, a diferencia de sourceUrl: la puerta es addUpdate en
+  // src/people.js, que ya es el único camino a la tabla. Un departamento fuera
+  // de la lista entra como null en vez de como texto que no compara con nada.
+  //
   // checkDuplicates / includePriorPhoto: each is its own Rekognition call or
   // extra store read, and only the web form and (for duplicates) the JSON API
   // render anything from them — the WhatsApp bot's reply never mentions a
@@ -109,6 +118,8 @@ function createReportAdmission({
     reporter = null,
     contact = null,
     externalId,
+    department = null,
+    age = null,
     photos = [],
     skipAddresses = [],
     checkDuplicates = false,
@@ -201,7 +212,9 @@ function createReportAdmission({
         sourceUrl: cleanSourceUrl,
         reporter,
         contact,
-        externalId
+        externalId,
+        department,
+        age
       });
 
       // ---- 4. Resolve the ACTUAL owner -----------------------------------

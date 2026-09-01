@@ -59,6 +59,16 @@ async function createSqliteAdapter(dbPath) {
       source TEXT NOT NULL CHECK (source IN ('web','whatsapp','api','aggregator','rescate')),
       reporter TEXT,
       external_id TEXT,
+      -- Señales declaradas por quien reporta, para no fusionar dos personas
+      -- distintas que comparten un nombre parecido (#150). Van en el update y
+      -- no en la tabla people a propósito: cada reporte declara lo suyo, y la
+      -- comparación es entre lo que declaró cada uno.
+      --
+      -- Las dos son NULL-ables y lo van a ser mucho: los updates anteriores a
+      -- estas columnas, el bot y el agregador no las traen. NULL significa "no
+      -- declarado" y nunca puede vetar una fusión.
+      department TEXT,
+      age INTEGER,
       created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
     );
     CREATE INDEX IF NOT EXISTS idx_updates_person ON updates(person_id, created_at DESC);
@@ -237,6 +247,12 @@ async function createSqliteAdapter(dbPath) {
   try {
     db.exec('ALTER TABLE updates ADD COLUMN source_url TEXT');
   } catch { /* already exists */ }
+  // Bases creadas antes de las señales de des-duplicación (#150).
+  for (const col of ['department TEXT', 'age INTEGER']) {
+    try {
+      db.exec(`ALTER TABLE updates ADD COLUMN ${col}`);
+    } catch { /* already exists */ }
+  }
   // Detection geometry (bounding box + landmarks) for the public overlay, and
   // the face thumbnail the public listing loads instead of the full photo.
   for (const col of ['face_detail TEXT', 'thumb BLOB', 'thumb_type TEXT', 'thumb_large BLOB']) {
@@ -385,12 +401,15 @@ async function createSqliteAdapter(dbPath) {
     // externalId updates the existing row's status/message/location/lat/lng/
     // reporter/contact instead of inserting a duplicate. Without externalId,
     // behavior is unchanged.
-    async insertUpdate(personId, { status, message, location, lat, lng, source, sourceUrl, reporter, contact, externalId }) {
+    async insertUpdate(
+      personId,
+      { status, message, location, lat, lng, source, sourceUrl, reporter, contact, externalId, department, age }
+    ) {
       const extId = externalId || null;
       const info = db
         .prepare(
-          `INSERT INTO updates (person_id, status, message, location, lat, lng, source, source_url, reporter, contact, external_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `INSERT INTO updates (person_id, status, message, location, lat, lng, source, source_url, reporter, contact, external_id, department, age)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT (external_id) WHERE external_id IS NOT NULL DO UPDATE SET
              status = excluded.status,
              message = excluded.message,
@@ -399,7 +418,9 @@ async function createSqliteAdapter(dbPath) {
              lng = excluded.lng,
              source_url = excluded.source_url,
              reporter = excluded.reporter,
-             contact = excluded.contact`
+             contact = excluded.contact,
+             department = excluded.department,
+             age = excluded.age`
         )
         .run(
           personId,
@@ -412,7 +433,9 @@ async function createSqliteAdapter(dbPath) {
           sourceUrl || null,
           reporter || null,
           contact || null,
-          extId
+          extId,
+          department || null,
+          age ?? null
         );
       // lastInsertRowid isn't reliable on the DO UPDATE path (no new row is
       // inserted), so look up by external_id (guaranteed unique) when we have one.
